@@ -1,0 +1,6 @@
+{
+  "name": "MangaPulse",
+  "description": "A premium full-featured client-side manga tracker with private GitHub repo synchronization, Paperback .pas4 backup importing, and high-thinking AI reading analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
