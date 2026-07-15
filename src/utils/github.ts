@@ -346,3 +346,50 @@ export async function createGitHubRepository(
   }
 }
 
+/**
+ * Compiles a detailed, metrics-driven commit message by comparing local and remote datasets.
+ */
+export function compileCommitMessage(local: DBDataset, remote: DBDataset | null): string {
+  if (!remote) {
+    return `Sync: Initialized database with ${local.manga.length} titles`;
+  }
+
+  let updatedTitlesCount = 0;
+  let totalChaptersDiff = 0;
+
+  local.manga.forEach((lm) => {
+    const rm = remote.manga.find((m) => m.id === lm.id);
+    if (!rm) {
+      updatedTitlesCount++;
+    } else if (
+      lm.status !== rm.status ||
+      lm.rating !== rm.rating ||
+      lm.notes !== rm.notes ||
+      lm.totalChapters !== rm.totalChapters ||
+      lm.lastRead !== rm.lastRead ||
+      lm.isBinge !== rm.isBinge ||
+      lm.isStalled !== rm.isStalled
+    ) {
+      updatedTitlesCount++;
+    }
+  });
+
+  local.library.forEach((ll) => {
+    const rl = remote.library.find((l) => l.mangaId === ll.mangaId);
+    if (!rl) {
+      totalChaptersDiff += ll.chaptersRead;
+    } else {
+      const diff = ll.chaptersRead - rl.chaptersRead;
+      if (diff > 0) {
+        totalChaptersDiff += diff;
+      }
+    }
+  });
+
+  if (updatedTitlesCount === 0 && totalChaptersDiff === 0) {
+    return `Sync: Updated library with ${local.manga.length} titles`;
+  }
+
+  return `Sync: Updated [${updatedTitlesCount}] titles, read [${totalChaptersDiff}] chapters`;
+}
+

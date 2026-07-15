@@ -397,7 +397,7 @@ export function BackupPayloadChart({ dataset }: ChartsProps) {
     return null;
   }
 
-  const maxVal = Math.max(...history.map((h) => h.sizeKB), 1);
+  const maxVal = Math.max(...history.map((h) => h.sizeInBytes || (h.sizeKB * 1024)), 1);
 
   return (
     <div className="bg-[#161618] p-5 rounded-xl border border-[#27272A]" id="backup-payload-chart">
@@ -410,19 +410,25 @@ export function BackupPayloadChart({ dataset }: ChartsProps) {
             d={history
               .map((h, idx) => {
                 const x = (idx / Math.max(1, history.length - 1)) * 100;
-                const y = 100 - (h.sizeKB / maxVal) * 100;
+                const val = h.sizeInBytes || (h.sizeKB * 1024);
+                const y = 100 - (val / maxVal) * 100;
                 return `${idx === 0 ? "M" : "L"} ${x} ${y}`;
               })
               .join(" ")}
             fill="none"
             stroke="#D98A6C"
             strokeWidth="2"
+            id="backup-payload-path"
           />
         </svg>
       </div>
       <div className="flex justify-between text-[9px] text-zinc-500 mt-2">
         <span>Oldest sync</span>
-        <span>Latest ({history[history.length - 1].sizeKB} KB)</span>
+        <span>
+          Latest ({history[history.length - 1].sizeInBytes !== undefined
+            ? `${history[history.length - 1].sizeInBytes} bytes`
+            : `${history[history.length - 1].sizeKB} KB`})
+        </span>
       </div>
     </div>
   );

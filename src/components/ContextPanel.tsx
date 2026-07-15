@@ -6,6 +6,7 @@ import {
   predictNextRelease,
   calculateStallDecay,
   isTitleOnHiatus,
+  getMangaRecommendations,
 } from "../utils/analytics";
 import { Star, Clock, AlertTriangle, Calendar, RefreshCw, X, Save, Edit3, Trash2 } from "lucide-react";
 
@@ -17,6 +18,8 @@ interface ContextPanelProps {
   onSaveManga: (updated: MangaEntry) => void;
   onUpdateProgress: (mangaId: string, chaptersRead: number) => void;
   onDeleteManga: (mangaId: string) => void;
+  allManga?: MangaEntry[];
+  onSelectManga?: (manga: MangaEntry) => void;
 }
 
 export function ContextPanel({
@@ -27,6 +30,8 @@ export function ContextPanel({
   onSaveManga,
   onUpdateProgress,
   onDeleteManga,
+  allManga = [],
+  onSelectManga,
 }: ContextPanelProps) {
   const [isEditingNotes, setIsEditingNotes] = useState(false);
   const [notesText, setNotesText] = useState(manga.notes || "");
@@ -107,6 +112,63 @@ export function ContextPanel({
 
       {/* Panel Contents Scrollable */}
       <div className="flex-1 p-5 overflow-y-auto space-y-6 scrollbar-thin scrollbar-thumb-zinc-800 text-xs">
+        {/* Task 7: Warning Block for Dropped or Stalled Titles */}
+        {(manga.status === "dropped" || manga.isStalled) && (
+          <div className="bg-amber-950/20 border border-amber-800/40 p-4 rounded-xl space-y-2.5" id="recommendation-warning">
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="w-4.5 h-4.5 text-amber-500 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <h4 className="font-bold text-amber-400 font-mono text-[10px] uppercase tracking-wider">
+                  {manga.status === "dropped" ? "Dropped Title Alert" : "Stalled Progress Warning"}
+                </h4>
+                <p className="text-zinc-400 leading-relaxed text-[11px]">
+                  {manga.status === "dropped"
+                    ? "This series is currently marked as Dropped. Check out these highly-rated completed or active titles matching similar genres or authors:"
+                    : `You haven't read this series in over ${daysSinceActivity} days. If you have stalled on this track, here are some recommended alternatives:`}
+                </p>
+              </div>
+            </div>
+
+            {getMangaRecommendations(manga, allManga).length > 0 && (
+              <div className="pt-2.5 border-t border-amber-800/20 space-y-2">
+                <span className="text-[9px] text-amber-500/85 uppercase font-bold tracking-wider font-mono">
+                  Recommended Alternatives:
+                </span>
+                <div className="grid grid-cols-1 gap-2">
+                  {getMangaRecommendations(manga, allManga).map((rec) => (
+                    <div
+                      key={rec.id}
+                      onClick={() => {
+                        if (onSelectManga) {
+                          onSelectManga(rec);
+                        }
+                      }}
+                      className="flex items-center gap-2.5 bg-zinc-900/60 hover:bg-zinc-900 border border-zinc-800 hover:border-amber-700/40 p-2 rounded-lg cursor-pointer transition-all duration-200"
+                    >
+                      {rec.coverUrl ? (
+                        <img src={rec.coverUrl} alt={rec.title} className="w-8 h-10 object-cover rounded" referrerPolicy="no-referrer" />
+                      ) : (
+                        <div className="w-8 h-10 bg-zinc-800 flex items-center justify-center text-xs rounded">📖</div>
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="font-bold text-[#EAD9C6] truncate text-[11px]">{rec.title}</div>
+                        <div className="text-[9px] text-zinc-500 font-medium truncate">
+                          {rec.author || "Unknown"} • {rec.genres?.slice(0, 2).join(", ") || "No genres"}
+                        </div>
+                      </div>
+                      {rec.rating > 0 && (
+                        <div className="flex items-center gap-0.5 text-[#D98A6C] font-bold text-[10px] font-mono mr-1">
+                          ★{rec.rating}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Core Layout: Cover & Basic fields */}
         <div className="flex gap-4">
           <div className="w-28 h-40 bg-[#161618] rounded-lg overflow-hidden border border-[#27272A] shrink-0 relative shadow-md">

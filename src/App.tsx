@@ -1,10 +1,10 @@
 import React, { useState, useEffect } from "react";
 import { DBDataset, MangaEntry, LibraryEntry, AppSettings, SyncStatus, MangaStatus } from "./types";
 import { getDbDataset, saveDbDataset, getLocalItem, setLocalItem, getDefaultDataset, addErrorLog } from "./utils/db";
-import { fetchFromGitHub, pushToGitHub, testGitHubConnection, hasDatasetChanged } from "./utils/github";
+import { fetchFromGitHub, pushToGitHub, testGitHubConnection, hasDatasetChanged, compileCommitMessage } from "./utils/github";
 import { decryptText } from "./utils/crypto";
-import { parsePaperbackBackup } from "./utils/paperback";
-import { calculateReadingStreak, calculateVelocities } from "./utils/analytics";
+import { parsePaperbackBackup, getLastRawBackup } from "./utils/paperback";
+import { calculateReadingStreak, calculateVelocities, updateMangaFlags, generateWidgetPayload } from "./utils/analytics";
 
 // Component Imports
 import { ReadingHeatmap, TimeOfDayChart, AnalyticsOverview, TitleCompareMatrix, BackupPayloadChart } from "./components/Charts";
@@ -12,6 +12,7 @@ import { AiOracle } from "./components/AiOracle";
 import { ContextPanel } from "./components/ContextPanel";
 import { SettingsModal } from "./components/SettingsModal";
 import { ConflictResolutionModal } from "./components/ConflictResolutionModal";
+import { JSONInspector } from "./components/JSONInspector";
 
 // Icons
 import {
@@ -64,6 +65,7 @@ export default function App() {
   const [isAiOpen, setIsAiOpen] = useState(false);
   const [activeManga, setActiveManga] = useState<MangaEntry | null>(null);
   const [conflictData, setConflictData] = useState<{ local: DBDataset; remote: DBDataset; sha: string } | null>(null);
+  const [rawBackup, setRawBackup] = useState<{ librarymanga: any; sourcemanga: any; mangainfo: any } | null>(null);
 
   // Filters and Views States
   const [searchQuery, setSearchQuery] = useState("");
@@ -88,7 +90,14 @@ export default function App() {
 
         // Get local cached dataset
         const localData = await getDbDataset();
-        setDataset(localData);
+        const initialSettings = localData.settings || {
+          stallThresholdDays: 14,
+          bingeThresholdHours: 48,
+          difficultyThresholds: { easy: 5, medium: 15, hard: 30 }
+        };
+        const updatedMangaList = updateMangaFlags(localData.manga, localData.library, initialSettings);
+        const localDataWithFlags = { ...localData, manga: updatedMangaList };
+        setDataset(localDataWithFlags);
 
         // Fetch saved credentials from cache
         const savedPat = await getLocalItem<string>("encrypted_pat") || "";
@@ -217,7 +226,7 @@ export default function App() {
         }
       } else if (localTime > remoteTime || hasDatasetChanged(localData, remoteData)) {
         // Local is newer or has modifications. Push local back to GitHub!
-        const changeMsg = `Synced: Updated library with ${localData.manga.length} titles`;
+        const changeMsg = compileCommitMessage(localData, remoteData);
         const updatedLocal = {
           ...localData,
           metadata: {
@@ -312,19 +321,47 @@ export default function App() {
       const parsedDataset = await parsePaperbackBackup(buffer);
       setImportProgress(90);
 
+      // Task 5: Backup Payload Size tracking (sizeInBytes and sizeKB)
+      const sizeInBytes = file.size;
+      const sizeKB = Math.round((sizeInBytes / 1024) * 100) / 100;
+      const newHistoryItem = {
+        timestamp: Math.floor(Date.now() / 1000),
+        sizeKB,
+        sizeInBytes,
+      };
+      const nextMetadata = {
+        ...(parsedDataset.metadata || { lastSync: Math.floor(Date.now() / 1000), version: "1.0", history: [] }),
+        history: [...(parsedDataset.metadata?.history || []), newHistoryItem]
+      };
+
+      // Recalculate isBinge and isStalled flags upon import for all items
+      const currentSettings = parsedDataset.settings || dataset.settings || {
+        stallThresholdDays: 14,
+        bingeThresholdHours: 48,
+        difficultyThresholds: { easy: 5, medium: 15, hard: 30 }
+      };
+      const updatedMangaList = updateMangaFlags(parsedDataset.manga, parsedDataset.library, currentSettings);
+
+      const finalDataset = {
+        ...parsedDataset,
+        manga: updatedMangaList,
+        metadata: nextMetadata,
+      };
+
       // Save into local IndexedDB
-      setDataset(parsedDataset);
-      await saveDbDataset(parsedDataset);
+      setDataset(finalDataset);
+      await saveDbDataset(finalDataset);
+      setRawBackup(getLastRawBackup());
 
       setImportProgress(100);
-      alert(`Import complete! Loaded and fuzzy-merged ${parsedDataset.manga.length} titles.`);
+      alert(`Import complete! Loaded and fuzzy-merged ${finalDataset.manga.length} titles.`);
 
       // Prompt to push to GitHub if connected
       if (encryptedPat && githubRepo) {
         const pass = prompt("MangaPulse parsed. Enter passphrase to push this imported library directly to your GitHub repository:");
         if (pass) {
           const pat = await decryptText(encryptedPat, pass);
-          await performSynchronization(pat, githubRepo, githubFilepath, parsedDataset);
+          await performSynchronization(pat, githubRepo, githubFilepath, finalDataset);
         }
       }
     } catch (err: any) {
@@ -391,8 +428,6 @@ export default function App() {
         return {
           ...m,
           lastRead: nowSecs,
-          // Calculate if binge row eligibility applies
-          isBinge: chaptersRead > 5,
         };
       }
       return m;
@@ -408,9 +443,16 @@ export default function App() {
     const oldestAddedDate = mangaList.reduce((min, m) => (m.addedDate < min ? m.addedDate : min), nowSecs);
     const newVelocities = calculateVelocities(libraryList, oldestAddedDate);
 
+    // Apply true Binge and Stall Engine threshold calculations dynamically!
+    const finalMangaList = updateMangaFlags(mangaList, libraryList, dataset.settings || {
+      stallThresholdDays: 14,
+      bingeThresholdHours: 48,
+      difficultyThresholds: { easy: 5, medium: 15, hard: 30 }
+    });
+
     const nextDataset: DBDataset = {
       ...dataset,
-      manga: mangaList,
+      manga: finalMangaList,
       library: libraryList,
       stats: {
         ...dataset.stats,
@@ -423,7 +465,7 @@ export default function App() {
     await saveDbDataset(nextDataset);
 
     // Update active select card reference if open
-    const matchingManga = mangaList.find((m) => m.id === mangaId);
+    const matchingManga = finalMangaList.find((m) => m.id === mangaId);
     if (matchingManga) {
       setActiveManga(matchingManga);
     }
@@ -535,6 +577,152 @@ export default function App() {
   const uniqueGenres = Array.from(new Set(dataset.manga.flatMap((m) => m.genres || []))).sort();
   const uniqueSources = Array.from(new Set(dataset.manga.map((m) => m.sourceId))).sort();
 
+  const formatTimeAgo = (secs: number) => {
+    if (!secs) return "Never";
+    const diff = Math.floor(Date.now() / 1000) - secs;
+    if (diff < 60) return "Just now";
+    const mins = Math.floor(diff / 60);
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    if (days === 1) return "Yesterday";
+    return `${days} days ago`;
+  };
+
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const weekSecs = 7 * 24 * 3600;
+  const monthSecs = 30 * 24 * 3600;
+
+  const chaptersThisWeek = dataset.history
+    ? dataset.history
+        .filter((h) => nowSecs - h.timestamp <= weekSecs)
+        .reduce((sum, h) => sum + (h.chapterProgress || 1), 0)
+    : 0;
+
+  const chaptersThisMonth = dataset.history
+    ? dataset.history
+        .filter((h) => nowSecs - h.timestamp <= monthSecs)
+        .reduce((sum, h) => sum + (h.chapterProgress || 1), 0)
+    : 0;
+
+  const totalChaptersRead = dataset.stats?.totalChaptersRead || 0;
+  const showDeepAnalytics = dataset.library.length > 0 && totalChaptersRead >= 20;
+
+  // Reading Now shelf (active, non-stalled reading entries)
+  const readingNowManga = dataset.manga.filter((m) => {
+    if (m.status !== "reading") return false;
+    const thresholdDays = dataset.settings?.stallThresholdDays || 14;
+    const lastActivitySecs = m.lastRead || m.addedDate;
+    const daysSince = (nowSecs - lastActivitySecs) / (24 * 3600);
+    return daysSince <= thresholdDays;
+  });
+
+  // Stalled shelf
+  const stalledMangaShelf = dataset.manga.filter((m) => {
+    if (m.status !== "reading") return false;
+    const thresholdDays = dataset.settings?.stallThresholdDays || 14;
+    const lastActivitySecs = m.lastRead || m.addedDate;
+    const daysSince = (nowSecs - lastActivitySecs) / (24 * 3600);
+    return daysSince > thresholdDays;
+  });
+
+  // Planned shelf
+  const plannedMangaShelf = dataset.manga.filter((m) => m.status === "planning" || m.status === "on_hold");
+
+  // Completed shelf
+  const completedMangaShelf = dataset.manga.filter((m) => m.status === "completed");
+
+  // Recently added
+  const recentlyAddedMangaShelf = dataset.manga
+    .slice()
+    .sort((a, b) => (b.addedDate || 0) - (a.addedDate || 0))
+    .slice(0, 8);
+
+  // Continue Reading (top 3 reading entries)
+  const continueReadingManga = dataset.manga
+    .filter((m) => m.status === "reading")
+    .sort((a, b) => (b.lastRead || b.addedDate || 0) - (a.lastRead || a.addedDate || 0))
+    .slice(0, 3);
+
+  // Recommendations for Reading Radar
+  const radarRecommendations: Array<{
+    type: "stalled" | "completion" | "binge" | "welcome";
+    title: string;
+    description: string;
+    actionText: string;
+    manga?: MangaEntry;
+  }> = [];
+
+  // 1. Stalled recommendations
+  const stalledCandidate = dataset.manga.find((m) => {
+    if (m.status !== "reading") return false;
+    const thresholdDays = dataset.settings?.stallThresholdDays || 14;
+    const lastActivitySecs = m.lastRead || m.addedDate;
+    const daysSince = (nowSecs - lastActivitySecs) / (24 * 3600);
+    return daysSince > thresholdDays;
+  });
+
+  if (stalledCandidate) {
+    const days = Math.floor((nowSecs - (stalledCandidate.lastRead || stalledCandidate.addedDate)) / 86400);
+    radarRecommendations.push({
+      type: "stalled",
+      title: "Stalled Series Notice",
+      description: `You haven't read any chapters of ${stalledCandidate.title} in ${days} days. Jump back in to sustain your momentum!`,
+      actionText: "Resume Reading",
+      manga: stalledCandidate,
+    });
+  }
+
+  // 2. Nearly Completed recommendations
+  const nearCompletionCandidate = dataset.manga.find((m) => {
+    if (m.status !== "reading" || !m.totalChapters) return false;
+    const lib = dataset.library.find((l) => l.mangaId === m.id);
+    if (!lib) return false;
+    const ratio = lib.chaptersRead / m.totalChapters;
+    return ratio >= 0.8 && ratio < 1.0;
+  });
+
+  if (nearCompletionCandidate) {
+    const lib = dataset.library.find((l) => l.mangaId === nearCompletionCandidate.id);
+    radarRecommendations.push({
+      type: "completion",
+      title: "Nearly Finished Series",
+      description: `You've completed ${Math.round(((lib?.chaptersRead || 0) / nearCompletionCandidate.totalChapters!) * 100)}% of ${nearCompletionCandidate.title}. Only ${nearCompletionCandidate.totalChapters! - (lib?.chaptersRead || 0)} chapters remain!`,
+      actionText: "Finish Series",
+      manga: nearCompletionCandidate,
+    });
+  }
+
+  // 3. Binge recommendation
+  const bingeCandidate = dataset.manga.find((m) => {
+    if (m.status !== "reading") return false;
+    const lib = dataset.library.find((l) => l.mangaId === m.id);
+    return lib && lib.chaptersRead >= 5 && m.isBinge;
+  });
+
+  if (bingeCandidate) {
+    radarRecommendations.push({
+      type: "binge",
+      title: "Binge Mode Active",
+      description: `You are reading ${bingeCandidate.title} at an incredible speed. Keep the streak hot!`,
+      actionText: "Continue Binge",
+      manga: bingeCandidate,
+    });
+  }
+
+  if (radarRecommendations.length === 0) {
+    radarRecommendations.push({
+      type: "welcome",
+      title: "Radar Scan Complete",
+      description: "You're fully up-to-date across all ongoing series! Choose a title from your shelves below to begin tracking your next session.",
+      actionText: "Explore Shelves",
+    });
+  }
+
+  // Active filter state
+  const isFiltering = searchQuery.trim() !== "" || selectedGenre !== "" || selectedSource !== "" || selectedRating !== "" || statusTab !== "all";
+
   return (
     <div className="h-screen w-full bg-[#121212] text-[#EAD9C6] flex flex-col font-sans overflow-hidden antialiased selection:bg-[#D98A6C] selection:text-[#121212]">
       
@@ -559,39 +747,13 @@ export default function App() {
             </div>
             <h1 className="text-xl font-bold tracking-tight text-[#EAD9C6]">Manga<span className="text-[#D98A6C]">Pulse</span></h1>
           </div>
-          <nav className="hidden md:flex gap-6 ml-10 text-sm font-medium text-zinc-400">
-            <button
-              onClick={() => { setStatusTab("all"); setSearchQuery(""); }}
-              className={`pb-4 -mb-4 px-1 transition-colors cursor-pointer ${statusTab === "all" && searchQuery === "" ? "text-[#D98A6C] border-b-2 border-[#D98A6C]" : "hover:text-[#EAD9C6]"}`}
-            >
-              Dashboard
-            </button>
-            <button
-              onClick={() => { setStatusTab("reading"); }}
-              className={`pb-4 -mb-4 px-1 transition-colors cursor-pointer ${statusTab === "reading" ? "text-[#D98A6C] border-b-2 border-[#D98A6C]" : "hover:text-[#EAD9C6]"}`}
-            >
-              Library
-            </button>
-            <button
-              onClick={() => {
-                const elem = document.getElementById("analytics-charts");
-                elem?.scrollIntoView({ behavior: "smooth" });
-              }}
-              className="hover:text-[#EAD9C6] transition-colors cursor-pointer pb-4 -mb-4 px-1"
-            >
-              Analytics
-            </button>
-            <button
-              onClick={() => setIsSettingsOpen(true)}
-              className="hover:text-[#EAD9C6] transition-colors cursor-pointer pb-4 -mb-4 px-1"
-            >
-              Import
-            </button>
-          </nav>
+          <span className="hidden sm:inline text-xs font-mono text-zinc-500 tracking-widest uppercase ml-4 border-l border-[#27272A] pl-4">
+            Unified Workspace
+          </span>
         </div>
 
-        <div className="flex items-center gap-4">
-          {/* Clickable Sync indicator bubble */}
+        <div className="flex items-center gap-3">
+          {/* Clickable Sync Status Pill */}
           <div
             onClick={() => alert(`Sync status: ${syncStatus.status.toUpperCase()}\nLast updated: ${syncStatus.lastSyncTime ? new Date(syncStatus.lastSyncTime * 1000).toLocaleString() : "Never"}\nPending modifications count: ${syncStatus.pendingChangesCount}`)}
             className={`px-3 py-1 bg-[#121212] rounded-full border text-[10px] font-mono cursor-pointer flex items-center gap-2 transition-all ${
@@ -603,7 +765,7 @@ export default function App() {
             }`}
           >
             <div className={`w-2 h-2 rounded-full ${syncStatus.status === "synced" ? "bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]" : syncStatus.status === "error" ? "bg-red-500" : "bg-amber-500 animate-pulse"}`}></div>
-            <span className="uppercase font-semibold">{syncStatus.status}</span>
+            <span className="uppercase font-semibold text-[9px] tracking-wider">{syncStatus.status}</span>
             {syncStatus.lastSyncTime && (
               <span className="hidden sm:inline text-zinc-500">
                 • {Math.round((Math.floor(Date.now() / 1000) - syncStatus.lastSyncTime) / 60)}m ago
@@ -629,7 +791,7 @@ export default function App() {
 
           <button
             onClick={() => setIsSettingsOpen(true)}
-            title="Settings"
+            title="Settings Console"
             className="p-2 hover:bg-[#27272A] rounded-full transition-colors text-zinc-400 hover:text-[#EAD9C6] cursor-pointer"
           >
             <Settings className="w-4.5 h-4.5" />
@@ -637,498 +799,587 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Body with Sidebar + Main content flex layout */}
+      {/* Main Body scrolling workspace */}
       <div className="flex flex-1 overflow-hidden">
         
-        {/* Sidebar / Stats Rail */}
-        <aside className="hidden lg:flex w-64 bg-[#161618] border-r border-[#27272A] p-6 flex-col gap-8 shrink-0 overflow-y-auto">
-          <section>
-            <h3 className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-4 font-mono">Library Stats</h3>
-            <div className="grid gap-3">
-              <div className="bg-[#121212] p-3 rounded-lg border border-[#27272A]">
-                <div className="text-xs text-zinc-400">Tracked Titles</div>
-                <div className="text-2xl font-bold text-[#EAD9C6] font-mono">{dataset.manga.length}</div>
-              </div>
-              <div className="bg-[#121212] p-3 rounded-lg border border-[#27272A]">
-                <div className="text-xs text-zinc-400">Total Chapters</div>
-                <div className="text-2xl font-bold text-[#EAD9C6] font-mono">{dataset.stats?.totalChaptersRead || 0}</div>
-              </div>
-              <div className="bg-[#121212] p-3 rounded-lg border border-[#27272A]">
-                <div className="text-xs text-zinc-400">Current Streak</div>
-                <div className="text-2xl font-bold text-[#D98A6C] font-mono">
-                  {activeStreak} <span className="text-xs font-normal text-zinc-500">days</span>
-                </div>
-              </div>
-            </div>
-          </section>
+        {/* Unified scrolling canvas */}
+        <main className="flex-1 overflow-y-auto py-8 px-6 md:px-12 bg-[#121212] scrollbar-thin scrollbar-thumb-zinc-800">
+          <div className="max-w-6xl mx-auto space-y-10">
 
-          <section>
-            <h3 className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold mb-4 font-mono">Filters</h3>
-            <div className="flex flex-col gap-1">
-              {(["reading", "planned", "completed", "dropped", "all"] as Array<MangaStatus | "all">).map((st) => {
-                const count = st === "all" ? dataset.manga.length : dataset.manga.filter((m) => m.status === st).length;
-                const isActive = statusTab === st;
-                return (
-                  <button
-                    key={st}
-                    onClick={() => setStatusTab(st)}
-                    className={`flex items-center justify-between w-full px-3 py-2 rounded-md text-sm font-medium transition-all cursor-pointer ${
-                      isActive
-                        ? "bg-[#D98A6C]/10 text-[#D98A6C]"
-                        : "text-zinc-400 hover:text-[#EAD9C6] hover:bg-[#27272A]/10"
-                    }`}
-                  >
-                    <span className="capitalize">{st}</span>
-                    <span className={`text-[10px] px-1.5 rounded font-mono ${isActive ? "bg-[#D98A6C] text-[#121212]" : "bg-[#27272A] text-zinc-400"}`}>
-                      {count}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          </section>
-
-          <div className="mt-auto">
-            <div className="p-4 rounded-xl bg-gradient-to-br from-[#D98A6C]/20 to-transparent border border-[#D98A6C]/30">
-              <div className="text-xs text-[#D98A6C] font-bold mb-1 tracking-wider font-mono">VELOCITY</div>
-              <div className="text-lg font-bold italic text-[#EAD9C6] font-mono">
-                {dataset.stats?.velocity?.lifetime || 0} <span className="text-xs font-normal opacity-70 italic font-mono">ch/day</span>
-              </div>
-              <div className="h-1 w-full bg-[#121212] rounded-full mt-3 overflow-hidden">
-                <div
-                  className="h-full bg-[#D98A6C]"
-                  style={{
-                    width: `${Math.min(100, ((dataset.stats?.velocity?.lifetime || 0) / 3) * 100)}%`,
-                  }}
-                ></div>
-              </div>
-              <div className="text-[9px] text-zinc-500 mt-2 tracking-wide uppercase font-mono">Lifetime reading pace</div>
-            </div>
-          </div>
-        </aside>
-
-        {/* Main Content Area */}
-        <main className="flex-1 p-6 md:p-8 overflow-y-auto space-y-8">
-          
-          {/* Overview bento blocks - only visible on mobile/tablet because sidebar covers it on desktop */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 lg:hidden animate-fade-in" id="stats-grid">
-            <div className="bg-[#161618] p-4 rounded-xl border border-[#27272A] flex flex-col justify-between">
-              <span className="text-zinc-500 uppercase tracking-wider text-[9px] font-bold font-mono">Total Tracked Titles</span>
-              <span className="text-2xl font-extrabold text-[#EAD9C6] font-mono mt-1">{dataset.manga.length}</span>
-            </div>
-
-            <div className="bg-[#161618] p-4 rounded-xl border border-[#27272A] flex flex-col justify-between">
-              <span className="text-zinc-500 uppercase tracking-wider text-[9px] font-bold font-mono">Read Chapters</span>
-              <span className="text-2xl font-extrabold text-[#EAD9C6] font-mono mt-1">{dataset.stats?.totalChaptersRead || 0}</span>
-            </div>
-
-            <div className="bg-[#161618] p-4 rounded-xl border border-[#27272A] flex flex-col justify-between">
-              <span className="text-zinc-500 uppercase tracking-wider text-[9px] font-bold font-mono">Current Streak</span>
-              <div className="flex items-center gap-2 mt-1">
-                <span className="text-2xl font-extrabold text-[#D98A6C] font-mono">{activeStreak}</span>
-                <span className="text-xs text-zinc-400">days</span>
-              </div>
-            </div>
-
-            <div className="bg-[#161618] p-4 rounded-xl border border-[#27272A] flex flex-col justify-between">
-              <span className="text-zinc-500 uppercase tracking-wider text-[9px] font-bold font-mono">Velocity (Lifetime)</span>
-              <div className="flex items-center gap-2 mt-1">
-                <span className="text-2xl font-extrabold text-[#EAD9C6] font-mono">{dataset.stats?.velocity?.lifetime || 0}</span>
-                <span className="text-xs text-zinc-400">Ch/Day</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Binge Bucket Section */}
-          {bingeRowManga.length > 0 && (
-            <section className="space-y-4" id="binge-row">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xs font-bold tracking-widest uppercase text-zinc-400 flex items-center gap-2 font-mono">
-                  <span className="w-2 h-2 rounded-full bg-[#D98A6C] animate-pulse"></span>
-                  Binge Bucket
-                </h2>
-                <span className="text-[10px] text-zinc-500 font-mono uppercase">Last 48 Hours</span>
-              </div>
-              <div className="flex gap-4 overflow-x-auto pb-3 snap-x scrollbar-thin scrollbar-thumb-zinc-800">
-                {bingeRowManga.map((m) => {
-                  const lib = dataset.library.find((l) => l.mangaId === m.id);
-                  return (
-                    <div
-                      key={m.id}
-                      onClick={() => setActiveManga(m)}
-                      className="w-[220px] bg-[#161618] border-2 border-[#D98A6C] rounded-xl overflow-hidden shadow-xl shrink-0 snap-start cursor-pointer hover:scale-[1.02] transition-transform duration-200"
-                    >
-                      <div className="h-32 bg-zinc-800 relative overflow-hidden">
-                        {m.coverUrl ? (
-                          <img
-                            src={m.coverUrl}
-                            alt={m.title}
-                            className="w-full h-full object-cover"
-                            referrerPolicy="no-referrer"
-                          />
-                        ) : (
-                          <div className="w-full h-full flex items-center justify-center text-zinc-600 font-bold bg-[#121212]">📖</div>
-                        )}
-                        <div className="absolute inset-0 bg-gradient-to-t from-[#161618] to-transparent"></div>
-                        <div className="absolute bottom-2 left-3">
-                          <span className="px-1.5 py-0.5 bg-[#D98A6C] text-[#121212] text-[10px] font-bold rounded uppercase tracking-wider font-mono">Binging</span>
-                        </div>
-                      </div>
-                      <div className="p-3 space-y-1">
-                        <h4 className="font-bold text-sm truncate text-[#EAD9C6]">{m.title}</h4>
-                        <p className="text-[10px] text-zinc-500 font-mono">{lib?.chaptersRead || 0} chapters read</p>
-                        <div className="flex justify-between items-end pt-1">
-                          <div className="text-xs">
-                            <span className="text-[#EAD9C6] font-bold font-mono">{lib?.chaptersRead || 0}</span>
-                            <span className="text-zinc-600 font-mono">/{m.totalChapters || "∞"}</span>
-                          </div>
-                          <div className="text-[10px] text-zinc-500 font-mono">
-                            {m.totalChapters ? `${Math.round(((lib?.chaptersRead || 0) / m.totalChapters) * 100)}% done` : "ongoing"}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </section>
-          )}
-
-          {/* Stalled Row Section */}
-          {stalledRowManga.length > 0 && (
-            <section className="space-y-4" id="stalled-row">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xs font-bold tracking-widest uppercase text-zinc-400 flex items-center gap-2 font-mono">
-                  <span className="w-2 h-2 rounded-full bg-yellow-600/80"></span>
-                  Stalled Bucket
-                </h2>
-                <span className="text-[10px] text-zinc-500 font-mono uppercase">Inactive series</span>
-              </div>
-              <div className="flex gap-4 overflow-x-auto pb-3 snap-x scrollbar-thin scrollbar-thumb-zinc-800">
-                {stalledRowManga.map((m) => {
-                  const lib = dataset.library.find((l) => l.mangaId === m.id);
-                  return (
-                    <div
-                      key={m.id}
-                      onClick={() => setActiveManga(m)}
-                      className="w-[220px] bg-[#161618] border border-[#27272A] rounded-xl overflow-hidden shadow-md shrink-0 snap-start cursor-pointer opacity-80 hover:opacity-100 hover:border-yellow-600/50 hover:scale-[1.02] transition-all duration-200"
-                    >
-                      <div className="h-32 bg-zinc-800 relative overflow-hidden">
-                        {m.coverUrl ? (
-                          <img
-                            src={m.coverUrl}
-                            alt={m.title}
-                            className="w-full h-full object-cover grayscale"
-                            referrerPolicy="no-referrer"
-                          />
-                        ) : (
-                          <div className="w-full h-full flex items-center justify-center text-zinc-600 font-bold bg-[#121212]">📖</div>
-                        )}
-                        <div className="absolute inset-0 bg-gradient-to-t from-[#161618] to-transparent"></div>
-                        <div className="absolute bottom-2 left-3">
-                          <span className="px-1.5 py-0.5 bg-yellow-600/80 text-white text-[10px] font-bold rounded uppercase tracking-wider font-mono">Stalled</span>
-                        </div>
-                      </div>
-                      <div className="p-3 space-y-1">
-                        <h4 className="font-bold text-sm truncate text-[#EAD9C6]">{m.title}</h4>
-                        <p className="text-[10px] text-zinc-500 font-mono">Last: {lib ? new Date(lib.lastRead * 1000).toLocaleDateString() : "Never"}</p>
-                        <div className="flex justify-between items-end pt-1">
-                          <div className="text-xs">
-                            <span className="text-[#EAD9C6] font-bold font-mono">{lib?.chaptersRead || 0}</span>
-                            <span className="text-zinc-600 font-mono">/{m.totalChapters || "∞"}</span>
-                          </div>
-                          <div className="text-[10px] text-zinc-500 font-mono">
-                            {m.totalChapters ? `${Math.round(((lib?.chaptersRead || 0) / m.totalChapters) * 100)}% done` : "ongoing"}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </section>
-          )}
-
-          {/* Active Reading Section & Filters */}
-          <section className="space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-bold tracking-widest uppercase text-zinc-400 font-mono">Active Library</h2>
-              <div className="flex items-center gap-2 text-xs font-mono">
-                <span className="text-zinc-500 uppercase">Sort:</span>
-                <span className="text-[#D98A6C] font-semibold">Recent</span>
-              </div>
-            </div>
-
-            {/* Filter controls panel */}
-            <div className="bg-[#161618] p-5 rounded-xl border border-[#27272A] space-y-4">
-              {/* Search and Paperback Unpacker */}
-              <div className="flex flex-col md:flex-row gap-3">
-                <div className="flex-1 relative">
-                  <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-zinc-500" />
-                  <input
-                    type="text"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Search library titles, authors, extensions..."
-                    className="w-full bg-[#121212] border border-[#27272A] rounded-lg pl-10 pr-4 py-2 text-xs text-[#EAD9C6] placeholder-zinc-500 focus:outline-none focus:border-[#D98A6C] transition-colors"
-                  />
+            {/* Section 1: CONTINUE READING */}
+            {continueReadingManga.length > 0 && (
+              <section className="space-y-4">
+                <div className="flex items-center gap-2 border-b border-[#27272A]/40 pb-2">
+                  <span className="w-2 h-2 rounded-full bg-[#D98A6C]" />
+                  <h2 className="text-[10px] font-bold tracking-widest uppercase text-zinc-400 font-mono">Continue Reading</h2>
                 </div>
 
-                {/* Backup unpacker label */}
-                <label className="px-4 py-2 bg-[#27272A] hover:bg-zinc-800 border border-[#27272A] text-zinc-300 hover:text-[#EAD9C6] rounded-lg text-xs font-bold text-center cursor-pointer flex items-center justify-center gap-1.5 transition-colors shrink-0">
-                  <Database className="w-4 h-4 text-[#D98A6C]" /> Unzip .pas4 Backup
-                  <input
-                    type="file"
-                    accept=".pas4,.paperback,.json"
-                    onChange={handlePaperbackImport}
-                    className="hidden"
-                  />
-                </label>
-              </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+                  {continueReadingManga.map((m) => {
+                    const lib = dataset.library.find((l) => l.mangaId === m.id);
+                    const chaptersRead = lib?.chaptersRead || 0;
+                    const total = m.totalChapters || 0;
+                    const pct = total > 0 ? Math.min(100, Math.round((chaptersRead / total) * 100)) : 0;
 
-              {/* Status Tabs ROW - ONLY visible on mobile/tablet */}
-              <div className="flex flex-wrap gap-2 border-b border-[#27272A]/50 pb-3 justify-between items-center lg:hidden">
-                <div className="flex flex-wrap gap-1.5">
-                  {(["reading", "planned", "completed", "dropped", "all"] as Array<MangaStatus | "all">).map((tab) => (
-                    <button
-                      key={tab}
-                      onClick={() => setStatusTab(tab)}
-                      className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all cursor-pointer ${
-                        statusTab === tab
-                          ? "bg-[#D98A6C] text-[#121212]"
-                          : "bg-[#121212] border border-[#27272A] text-zinc-400 hover:text-[#EAD9C6]"
-                      }`}
-                    >
-                      {tab}
-                    </button>
-                  ))}
-                </div>
-
-                <div className="flex items-center gap-4">
-                  {/* Grid / List view selectors */}
-                  <div className="flex gap-1.5 bg-[#121212] p-1 rounded-lg border border-[#27272A]">
-                    <button
-                      onClick={() => setViewMode("grid")}
-                      className={`p-1.5 rounded ${viewMode === "grid" ? "bg-[#27272A] text-[#D98A6C]" : "text-zinc-500 hover:text-zinc-300"} cursor-pointer`}
-                    >
-                      <Grid className="w-4 h-4" />
-                    </button>
-                    <button
-                      onClick={() => setViewMode("row")}
-                      className={`p-1.5 rounded ${viewMode === "row" ? "bg-[#27272A] text-[#D98A6C]" : "text-zinc-500 hover:text-zinc-300"} cursor-pointer`}
-                    >
-                      <List className="w-4 h-4" />
-                    </button>
-                  </div>
-
-                  {/* Archive toggler */}
-                  <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={includeArchived}
-                      onChange={(e) => setIncludeArchived(e.target.checked)}
-                      className="accent-[#D98A6C] rounded"
-                    />
-                    Archived
-                  </label>
-                </div>
-              </div>
-
-              {/* Advanced filter toggles and view selectors for Desktop (since tabs are hidden on desktop) */}
-              <div className="hidden lg:flex justify-between items-center border-b border-[#27272A]/50 pb-3">
-                <span className="text-[10px] text-zinc-500 font-mono uppercase tracking-wider">Advanced Filters</span>
-                <div className="flex items-center gap-4">
-                  <div className="flex gap-1.5 bg-[#121212] p-1 rounded-lg border border-[#27272A]">
-                    <button
-                      onClick={() => setViewMode("grid")}
-                      title="Grid View"
-                      className={`p-1.5 rounded ${viewMode === "grid" ? "bg-[#27272A] text-[#D98A6C]" : "text-zinc-500 hover:text-zinc-300"} cursor-pointer`}
-                    >
-                      <Grid className="w-4 h-4" />
-                    </button>
-                    <button
-                      onClick={() => setViewMode("row")}
-                      title="Row List View"
-                      className={`p-1.5 rounded ${viewMode === "row" ? "bg-[#27272A] text-[#D98A6C]" : "text-zinc-500 hover:text-zinc-300"} cursor-pointer`}
-                    >
-                      <List className="w-4 h-4" />
-                    </button>
-                  </div>
-
-                  <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={includeArchived}
-                      onChange={(e) => setIncludeArchived(e.target.checked)}
-                      className="accent-[#D98A6C] rounded"
-                    />
-                    Show Archived
-                  </label>
-                </div>
-              </div>
-
-              {/* Advanced filter selectors */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div>
-                  <label className="block text-[10px] text-zinc-500 uppercase tracking-wider mb-1 font-mono">Filter by Genre</label>
-                  <select
-                    value={selectedGenre}
-                    onChange={(e) => setSelectedGenre(e.target.value)}
-                    className="w-full bg-[#121212] text-xs text-[#EAD9C6] px-3 py-2 rounded-lg border border-[#27272A] focus:outline-none focus:border-[#D98A6C]"
-                  >
-                    <option value="">All Genres</option>
-                    {uniqueGenres.map((g) => (
-                      <option key={g} value={g}>{g}</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-[10px] text-zinc-500 uppercase tracking-wider mb-1 font-mono">Filter by Source Extension</label>
-                  <select
-                    value={selectedSource}
-                    onChange={(e) => setSelectedSource(e.target.value)}
-                    className="w-full bg-[#121212] text-xs text-[#EAD9C6] px-3 py-2 rounded-lg border border-[#27272A] focus:outline-none focus:border-[#D98A6C]"
-                  >
-                    <option value="">All Sources</option>
-                    {uniqueSources.map((s) => (
-                      <option key={s} value={s}>{s}</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-[10px] text-zinc-500 uppercase tracking-wider mb-1 font-mono">Filter by Star Rating</label>
-                  <select
-                    value={selectedRating}
-                    onChange={(e) => setSelectedRating(e.target.value === "" ? "" : parseInt(e.target.value, 10))}
-                    className="w-full bg-[#121212] text-xs text-[#EAD9C6] px-3 py-2 rounded-lg border border-[#27272A] focus:outline-none focus:border-[#D98A6C]"
-                  >
-                    <option value="">All Ratings</option>
-                    {[5, 4, 3, 2, 1, 0].map((r) => (
-                      <option key={r} value={r}>{r} Stars</option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-            </div>
-
-            {/* Core Library Listing Grid/Row */}
-            {filteredManga.length === 0 ? (
-              <div className="bg-[#161618] border border-[#27272A] rounded-2xl p-12 text-center space-y-3" id="empty-state">
-                <BookOpen className="w-10 h-10 text-zinc-600 mx-auto" />
-                <h3 className="font-bold text-[#EAD9C6]">No matching series found</h3>
-                <p className="text-zinc-500 text-xs">Try adjusting your filters, searching other titles, or unpacking a new `.pas4` Paperback backup.</p>
-              </div>
-            ) : viewMode === "grid" ? (
-              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5 gap-4" id="manga-grid">
-                {filteredManga.map((m) => {
-                  const lib = dataset.library.find((l) => l.mangaId === m.id);
-                  return (
-                    <div
-                      key={m.id}
-                      onClick={() => setActiveManga(m)}
-                      className="bg-[#161618] border border-[#27272A] hover:border-zinc-700 p-3 rounded-xl flex flex-col justify-between cursor-pointer hover:scale-[1.02] transition-all group shadow-sm"
-                    >
-                      <div className="space-y-2">
-                        <div className="aspect-[3/4] bg-zinc-900 rounded-lg overflow-hidden border border-[#27272A] relative">
+                    return (
+                      <div
+                        key={m.id}
+                        onClick={() => setActiveManga(m)}
+                        className="group flex gap-4 p-4 bg-[#161618] border border-[#27272A] rounded-2xl hover:border-zinc-700 hover:bg-[#1a1a1d] cursor-pointer transition-all shadow-md relative overflow-hidden"
+                      >
+                        {/* Cover Art image */}
+                        <div className="w-16 h-24 bg-zinc-900 rounded-xl overflow-hidden shrink-0 border border-zinc-800 relative">
                           {m.coverUrl ? (
-                            <img src={m.coverUrl} alt={m.title} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                          ) : (
-                            <div className="w-full h-full flex items-center justify-center text-zinc-700 bg-[#121212]">📖</div>
-                          )}
-                          {m.status === "archived" && (
-                            <span className="absolute top-2 left-2 px-1.5 py-0.5 rounded bg-black/80 border border-[#27272A] text-zinc-500 text-[8px] uppercase font-bold tracking-wider font-mono">
-                              Archived
-                            </span>
-                          )}
-                        </div>
-                        <div className="space-y-0.5">
-                          <p className="font-bold text-xs truncate text-[#EAD9C6] group-hover:text-[#D98A6C] transition-colors">{m.title}</p>
-                          <p className="text-[10px] text-zinc-500 truncate">{m.author || "Unknown Author"}</p>
-                        </div>
-                      </div>
-
-                      <div className="pt-2 border-t border-[#27272A]/40 mt-2 space-y-1.5">
-                        <div className="flex justify-between text-[9px] text-zinc-500 font-mono">
-                          <span>Ch: {lib?.chaptersRead || 0}</span>
-                          <span>/ {m.totalChapters || "∞"}</span>
-                        </div>
-                        {m.totalChapters > 0 && (
-                          <div className="w-full h-1 bg-[#121212] rounded-full overflow-hidden">
-                            <div
-                              style={{ width: `${Math.min(100, ((lib?.chaptersRead || 0) / m.totalChapters) * 100)}%` }}
-                              className="h-full bg-[#D98A6C]"
+                            <img
+                              src={m.coverUrl}
+                              alt={m.title}
+                              className="w-full h-full object-cover transition-transform group-hover:scale-105"
+                              referrerPolicy="no-referrer"
                             />
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="bg-[#161618] border border-[#27272A] rounded-xl divide-y divide-[#27272A]" id="manga-list-rows">
-                {filteredManga.map((m) => {
-                  const lib = dataset.library.find((l) => l.mangaId === m.id);
-                  return (
-                    <div
-                      key={m.id}
-                      onClick={() => setActiveManga(m)}
-                      className="p-3 hover:bg-[#27272A]/15 cursor-pointer flex items-center justify-between gap-4"
-                    >
-                      <div className="flex items-center gap-3 min-w-0">
-                        <div className="w-10 h-14 bg-zinc-900 rounded border border-[#27272A] overflow-hidden shrink-0">
-                          {m.coverUrl ? (
-                            <img src={m.coverUrl} alt={m.title} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
                           ) : (
-                            <div className="w-full h-full flex items-center justify-center text-zinc-700 bg-[#121212]">📖</div>
+                            <div className="w-full h-full flex items-center justify-center text-zinc-700 font-bold">📖</div>
                           )}
                         </div>
-                        <div className="min-w-0">
-                          <p className="font-bold text-xs text-[#EAD9C6] truncate">{m.title}</p>
-                          <p className="text-[10px] text-zinc-500 truncate">{m.author || "Unknown Author"} • {m.sourceId}</p>
+
+                        {/* Text and stats */}
+                        <div className="flex flex-col justify-between flex-1 min-w-0 py-0.5">
+                          <div className="space-y-1">
+                            <div className="flex gap-1.5 flex-wrap items-center">
+                              <span className="text-[8px] font-bold font-mono px-1.5 py-0.5 bg-[#D98A6C]/10 text-[#D98A6C] rounded uppercase tracking-wider">Active</span>
+                              {m.isBinge && (
+                                <span className="text-[8px] font-bold font-mono px-1.5 py-0.5 bg-red-500/10 text-red-400 rounded uppercase tracking-wider">Bingeing</span>
+                              )}
+                            </div>
+                            <h3 className="font-bold text-[#EAD9C6] text-xs uppercase line-clamp-1 group-hover:text-[#D98A6C] transition-all tracking-wide">{m.title}</h3>
+                            <p className="text-[10px] text-zinc-500 truncate">{m.author || "Unknown Author"}</p>
+                          </div>
+
+                          <div className="space-y-1.5">
+                            <div className="flex justify-between items-center text-[9px] font-mono text-zinc-400">
+                              <span>Ch {chaptersRead} / {total || "∞"}</span>
+                              <span className="text-zinc-500">{pct}%</span>
+                            </div>
+                            <div className="w-full h-1 bg-[#121212] rounded-full overflow-hidden">
+                              <div
+                                style={{ width: `${pct || 5}%` }}
+                                className="h-full bg-[#D98A6C]"
+                              />
+                            </div>
+                            <div className="text-[9px] text-zinc-500 font-mono flex items-center gap-1">
+                              <Clock className="w-3 h-3 text-zinc-600" />
+                              <span>{formatTimeAgo(m.lastRead || m.addedDate)}</span>
+                            </div>
+                          </div>
                         </div>
                       </div>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
 
-                      <div className="text-right shrink-0">
-                        <span className="text-xs font-bold text-[#D98A6C] font-mono">Ch {lib?.chaptersRead || 0}</span>
-                        <span className="text-[10px] text-zinc-500 font-mono"> / {m.totalChapters || "∞"}</span>
+            {/* Section 2: READING MOMENTUM */}
+            <section className="space-y-4">
+              <div className="flex items-center gap-2 border-b border-[#27272A]/40 pb-2">
+                <span className="w-2 h-2 rounded-full bg-[#D98A6C]" />
+                <h2 className="text-[10px] font-bold tracking-widest uppercase text-zinc-400 font-mono">Reading Momentum</h2>
+              </div>
+
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                {/* Streak Card */}
+                <div className="bg-[#161618] border border-[#27272A] rounded-2xl p-4 flex items-center gap-4 shadow-sm">
+                  <div className="w-10 h-10 rounded-xl bg-[#D98A6C]/10 flex items-center justify-center text-[#D98A6C] shrink-0">
+                    <Flame className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <span className="block text-[10px] text-zinc-500 font-mono uppercase">Daily Streak</span>
+                    <span className="block text-lg font-bold font-mono text-[#EAD9C6] leading-tight">{activeStreak} <span className="text-xs font-normal text-zinc-500">Days</span></span>
+                    <span className="block text-[8px] text-zinc-600 uppercase font-mono tracking-wider mt-0.5">Consecutive reading</span>
+                  </div>
+                </div>
+
+                {/* Week Card */}
+                <div className="bg-[#161618] border border-[#27272A] rounded-2xl p-4 flex items-center gap-4 shadow-sm">
+                  <div className="w-10 h-10 rounded-xl bg-[#D98A6C]/10 flex items-center justify-center text-[#D98A6C] shrink-0">
+                    <BookOpen className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <span className="block text-[10px] text-zinc-500 font-mono uppercase">This Week</span>
+                    <span className="block text-lg font-bold font-mono text-[#EAD9C6] leading-tight">{chaptersThisWeek} <span className="text-xs font-normal text-zinc-500">Ch.</span></span>
+                    <span className="block text-[8px] text-zinc-600 uppercase font-mono tracking-wider mt-0.5">Chapters completed</span>
+                  </div>
+                </div>
+
+                {/* Month Card */}
+                <div className="bg-[#161618] border border-[#27272A] rounded-2xl p-4 flex items-center gap-4 shadow-sm">
+                  <div className="w-10 h-10 rounded-xl bg-[#D98A6C]/10 flex items-center justify-center text-[#D98A6C] shrink-0">
+                    <Calendar className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <span className="block text-[10px] text-zinc-500 font-mono uppercase">This Month</span>
+                    <span className="block text-lg font-bold font-mono text-[#EAD9C6] leading-tight">{chaptersThisMonth} <span className="text-xs font-normal text-zinc-500">Ch.</span></span>
+                    <span className="block text-[8px] text-zinc-600 uppercase font-mono tracking-wider mt-0.5">Chapters completed</span>
+                  </div>
+                </div>
+
+                {/* Speed Card */}
+                <div className="bg-[#161618] border border-[#27272A] rounded-2xl p-4 flex items-center gap-4 shadow-sm">
+                  <div className="w-10 h-10 rounded-xl bg-[#D98A6C]/10 flex items-center justify-center text-[#D98A6C] shrink-0">
+                    <Sparkles className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <span className="block text-[10px] text-zinc-500 font-mono uppercase">Reading Pace</span>
+                    <span className="block text-lg font-bold font-mono text-[#EAD9C6] leading-tight">
+                      {dataset.stats?.velocity?.lifetime || 0} <span className="text-xs font-normal text-zinc-500">Ch/Day</span>
+                    </span>
+                    <span className="block text-[8px] text-[#D98A6C] uppercase font-mono font-bold tracking-wider mt-0.5">
+                      {chaptersThisWeek > 14 ? "HIGH SPEED" : chaptersThisWeek > 5 ? "STEADY" : "MAINTAINING"}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            {/* Section 3: READING RADAR */}
+            <section className="space-y-4">
+              <div className="flex items-center gap-2 border-b border-[#27272A]/40 pb-2">
+                <span className="w-2 h-2 rounded-full bg-[#D98A6C]" />
+                <h2 className="text-[10px] font-bold tracking-widest uppercase text-zinc-400 font-mono">Reading Radar Recommendations</h2>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {radarRecommendations.map((rec, i) => (
+                  <div
+                    key={i}
+                    className="p-5 bg-[#1a1311] border border-[#44281f] rounded-2xl text-[#f4dcd6] flex items-start gap-4 relative overflow-hidden group"
+                  >
+                    <div className="w-10 h-10 rounded-xl bg-[#44281f] flex items-center justify-center text-[#D98A6C] shrink-0">
+                      <Sparkles className="w-5 h-5" />
+                    </div>
+                    <div className="space-y-2 flex-1">
+                      <h3 className="font-extrabold uppercase font-mono text-[10px] tracking-wider text-[#D98A6C]">{rec.title}</h3>
+                      <p className="text-xs text-[#EAD9C6]/85 leading-relaxed">{rec.description}</p>
+                      
+                      {rec.manga ? (
+                        <button
+                          onClick={() => setActiveManga(rec.manga)}
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-[#D98A6C] text-[#121212] hover:bg-[#e4a085] rounded-lg font-bold font-mono text-[9px] uppercase tracking-wider transition-colors cursor-pointer mt-2"
+                        >
+                          {rec.actionText} <ArrowRight className="w-3 h-3" />
+                        </button>
+                      ) : (
+                        <div className="text-[9px] font-mono text-zinc-500 uppercase tracking-widest mt-1">Status: nominal</div>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            {/* Section 4: LIBRARY SECTIONS */}
+            <section className="space-y-6">
+              
+              {/* Inline Search and Filter Bar */}
+              <div className="bg-[#161618] p-5 rounded-2xl border border-[#27272A] space-y-4 shadow-sm">
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <div className="flex-1 relative">
+                    <Search className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-zinc-500" />
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="Search series titles, authors, translators, tags..."
+                      className="w-full bg-[#121212] border border-[#27272A] rounded-xl pl-10 pr-4 py-2.5 text-xs text-[#EAD9C6] placeholder-zinc-500 focus:outline-none focus:border-[#D98A6C] transition-colors"
+                    />
+                  </div>
+
+                  {/* Unzip Paperback Backups manually inline */}
+                  <label className="px-4 py-2 bg-[#27272A] hover:bg-zinc-800 border border-[#27272A] text-zinc-300 hover:text-[#EAD9C6] rounded-xl text-xs font-bold text-center cursor-pointer flex items-center justify-center gap-1.5 transition-colors shrink-0 font-mono uppercase text-[10px] tracking-wider">
+                    <Database className="w-4 h-4 text-[#D98A6C]" /> Unzip .pas4
+                    <input
+                      type="file"
+                      accept=".pas4,.paperback,.json"
+                      onChange={handlePaperbackImport}
+                      className="hidden"
+                    />
+                  </label>
+                </div>
+
+                {/* Multiselect selectors */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2">
+                  <div>
+                    <label className="block text-[9px] text-zinc-500 uppercase tracking-widest mb-1 font-mono">Genre Tag</label>
+                    <select
+                      value={selectedGenre}
+                      onChange={(e) => setSelectedGenre(e.target.value)}
+                      className="w-full bg-[#121212] text-xs text-[#EAD9C6] px-3 py-2 rounded-lg border border-[#27272A] focus:outline-none focus:border-[#D98A6C] font-mono text-[10px]"
+                    >
+                      <option value="">All Genres</option>
+                      {uniqueGenres.map((g) => (
+                        <option key={g} value={g}>{g}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[9px] text-zinc-500 uppercase tracking-widest mb-1 font-mono">Source Extension</label>
+                    <select
+                      value={selectedSource}
+                      onChange={(e) => setSelectedSource(e.target.value)}
+                      className="w-full bg-[#121212] text-xs text-[#EAD9C6] px-3 py-2 rounded-lg border border-[#27272A] focus:outline-none focus:border-[#D98A6C] font-mono text-[10px]"
+                    >
+                      <option value="">All Sources</option>
+                      {uniqueSources.map((s) => (
+                        <option key={s} value={s}>{s}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[9px] text-zinc-500 uppercase tracking-widest mb-1 font-mono">Star Rating</label>
+                    <select
+                      value={selectedRating}
+                      onChange={(e) => setSelectedRating(e.target.value === "" ? "" : parseInt(e.target.value, 10))}
+                      className="w-full bg-[#121212] text-xs text-[#EAD9C6] px-3 py-2 rounded-lg border border-[#27272A] focus:outline-none focus:border-[#D98A6C] font-mono text-[10px]"
+                    >
+                      <option value="">All Ratings</option>
+                      {[5, 4, 3, 2, 1, 0].map((r) => (
+                        <option key={r} value={r}>{r} Stars</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[9px] text-zinc-500 uppercase tracking-widest mb-1 font-mono">Reading Status</label>
+                    <select
+                      value={statusTab}
+                      onChange={(e) => setStatusTab(e.target.value as MangaStatus | "all")}
+                      className="w-full bg-[#121212] text-xs text-[#EAD9C6] px-3 py-2 rounded-lg border border-[#27272A] focus:outline-none focus:border-[#D98A6C] font-mono text-[10px] uppercase"
+                    >
+                      <option value="all">All Statuses</option>
+                      <option value="reading">Reading Now</option>
+                      <option value="planning">Planned</option>
+                      <option value="completed">Completed</option>
+                      <option value="on_hold">On Hold</option>
+                      <option value="dropped">Dropped</option>
+                    </select>
+                  </div>
+                </div>
+
+                {isFiltering && (
+                  <div className="pt-2 flex justify-between items-center text-[10px] font-mono">
+                    <span className="text-zinc-500 uppercase">Filters active: showing {filteredManga.length} series matches</span>
+                    <button
+                      onClick={() => {
+                        setSearchQuery("");
+                        setSelectedGenre("");
+                        setSelectedSource("");
+                        setSelectedRating("");
+                        setStatusTab("all");
+                      }}
+                      className="text-[#D98A6C] hover:underline font-bold"
+                    >
+                      Clear All Filters
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Filtering / Search Results Active View */}
+              {isFiltering ? (
+                <div className="space-y-4">
+                  <div className="flex justify-between items-center border-b border-[#27272A]/40 pb-2">
+                    <h3 className="text-xs font-bold tracking-widest uppercase text-zinc-400 font-mono">Search & Filter Matches ({filteredManga.length})</h3>
+                  </div>
+
+                  {filteredManga.length === 0 ? (
+                    <div className="bg-[#161618] border border-[#27272A] rounded-2xl p-12 text-center space-y-2">
+                      <BookOpen className="w-10 h-10 text-zinc-600 mx-auto" />
+                      <h4 className="font-bold text-[#EAD9C6] text-xs uppercase tracking-wider font-mono">No matched entries found</h4>
+                      <p className="text-zinc-500 text-[10px]">Try resetting search values or setting broader genre/rating criteria.</p>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-5 gap-5">
+                      {filteredManga.map((m) => {
+                        const lib = dataset.library.find((l) => l.mangaId === m.id);
+                        const progress = lib?.chaptersRead || 0;
+                        const total = m.totalChapters || 0;
+
+                        return (
+                          <div
+                            key={m.id}
+                            onClick={() => setActiveManga(m)}
+                            className="bg-[#161618] border border-[#27272A] hover:border-zinc-700 rounded-xl p-3 flex flex-col justify-between cursor-pointer hover:scale-[1.02] transition-all group shadow-md"
+                          >
+                            <div className="space-y-2">
+                              <div className="aspect-[3/4] bg-zinc-900 rounded-lg overflow-hidden border border-[#27272A] relative">
+                                {m.coverUrl ? (
+                                  <img src={m.coverUrl} alt={m.title} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                                ) : (
+                                  <div className="w-full h-full flex items-center justify-center text-zinc-700 bg-[#121212] font-bold">📖</div>
+                                )}
+                                {m.rating ? (
+                                  <span className="absolute top-2 right-2 px-1.5 py-0.5 rounded bg-black/80 text-[#D98A6C] text-[8px] font-mono font-bold tracking-wider uppercase">
+                                    ★ {m.rating}
+                                  </span>
+                                ) : null}
+                              </div>
+                              <div className="space-y-0.5">
+                                <h4 className="font-bold text-xs truncate text-[#EAD9C6] group-hover:text-[#D98A6C] transition-all uppercase tracking-wide">{m.title}</h4>
+                                <p className="text-[10px] text-zinc-500 truncate">{m.author || "Unknown Author"}</p>
+                              </div>
+                            </div>
+
+                            <div className="pt-2 border-t border-[#27272A]/40 mt-3 space-y-1">
+                              <div className="flex justify-between text-[9px] text-zinc-500 font-mono">
+                                <span>Ch {progress}</span>
+                                <span>/ {total || "∞"}</span>
+                              </div>
+                              {total > 0 && (
+                                <div className="w-full h-1 bg-[#121212] rounded-full overflow-hidden">
+                                  <div
+                                    style={{ width: `${Math.min(100, (progress / total) * 100)}%` }}
+                                    className="h-full bg-[#D98A6C]"
+                                  />
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                /* Primary Scrolling Horizontal Shelves */
+                <div className="space-y-8">
+                  
+                  {/* Shelves 1: READING NOW */}
+                  {readingNowManga.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex justify-between items-center border-b border-[#27272A]/30 pb-2">
+                        <h3 className="text-[10px] font-bold tracking-widest uppercase text-zinc-400 font-mono flex items-center gap-1.5">
+                          <span className="w-2 h-2 rounded-full bg-green-500" /> Reading Now ({readingNowManga.length})
+                        </h3>
+                      </div>
+                      <div className="flex gap-4 overflow-x-auto pb-4 scrollbar-thin scrollbar-thumb-zinc-800">
+                        {readingNowManga.map((m) => {
+                          const lib = dataset.library.find((l) => l.mangaId === m.id);
+                          return (
+                            <div
+                              key={m.id}
+                              onClick={() => setActiveManga(m)}
+                              className="w-32 md:w-36 shrink-0 group relative cursor-pointer"
+                            >
+                              <div className="h-44 md:h-48 rounded-xl overflow-hidden relative border border-zinc-800/80 bg-zinc-900">
+                                {m.coverUrl ? (
+                                  <img src={m.coverUrl} alt={m.title} className="w-full h-full object-cover transition-transform group-hover:scale-105" referrerPolicy="no-referrer" />
+                                ) : (
+                                  <div className="w-full h-full flex items-center justify-center text-zinc-700 bg-[#121212] font-bold">📖</div>
+                                )}
+                                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-2">
+                                  <span className="text-[9px] text-[#D98A6C] font-mono uppercase font-bold">Resume Tracking</span>
+                                </div>
+                                <span className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded bg-black/85 text-[#D98A6C] text-[8px] font-mono font-bold border border-zinc-800">
+                                  Ch {lib?.chaptersRead || 0}
+                                </span>
+                              </div>
+                              <h4 className="mt-2 font-bold uppercase text-[10px] tracking-wide line-clamp-1 text-[#EAD9C6] group-hover:text-[#D98A6C] transition-colors">{m.title}</h4>
+                              <p className="text-[9px] text-zinc-500 font-mono mt-0.5">{m.author || "Unknown"}</p>
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
-                  );
-                })}
+                  )}
+
+                  {/* Shelves 2: STALLED */}
+                  {stalledMangaShelf.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex justify-between items-center border-b border-[#27272A]/30 pb-2">
+                        <h3 className="text-[10px] font-bold tracking-widest uppercase text-zinc-400 font-mono flex items-center gap-1.5">
+                          <span className="w-2 h-2 rounded-full bg-amber-500" /> Stagnant / Stalled Series ({stalledMangaShelf.length})
+                        </h3>
+                      </div>
+                      <div className="flex gap-4 overflow-x-auto pb-4 scrollbar-thin scrollbar-thumb-zinc-800">
+                        {stalledMangaShelf.map((m) => {
+                          const lib = dataset.library.find((l) => l.mangaId === m.id);
+                          return (
+                            <div
+                              key={m.id}
+                              onClick={() => setActiveManga(m)}
+                              className="w-32 md:w-36 shrink-0 group relative cursor-pointer opacity-75 hover:opacity-100 transition-all"
+                            >
+                              <div className="h-44 md:h-48 rounded-xl overflow-hidden relative border border-zinc-800/80 bg-zinc-900">
+                                {m.coverUrl ? (
+                                  <img src={m.coverUrl} alt={m.title} className="w-full h-full object-cover transition-transform group-hover:scale-105 grayscale group-hover:grayscale-0" referrerPolicy="no-referrer" />
+                                ) : (
+                                  <div className="w-full h-full flex items-center justify-center text-zinc-700 bg-[#121212] font-bold">📖</div>
+                                )}
+                                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-2">
+                                  <span className="text-[9px] text-amber-500 font-mono uppercase font-bold">Unstall Series</span>
+                                </div>
+                                <span className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded bg-black/85 text-amber-500 text-[8px] font-mono font-bold border border-zinc-800">
+                                  Ch {lib?.chaptersRead || 0}
+                                </span>
+                              </div>
+                              <h4 className="mt-2 font-bold uppercase text-[10px] tracking-wide line-clamp-1 text-[#EAD9C6] group-hover:text-[#D98A6C] transition-colors">{m.title}</h4>
+                              <p className="text-[9px] text-zinc-500 font-mono mt-0.5">Last read {formatTimeAgo(m.lastRead || m.addedDate)}</p>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Shelves 3: PLANNED */}
+                  {plannedMangaShelf.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex justify-between items-center border-b border-[#27272A]/30 pb-2">
+                        <h3 className="text-[10px] font-bold tracking-widest uppercase text-zinc-400 font-mono flex items-center gap-1.5">
+                          <span className="w-2 h-2 rounded-full bg-zinc-500" /> Planned / On Hold ({plannedMangaShelf.length})
+                        </h3>
+                      </div>
+                      <div className="flex gap-4 overflow-x-auto pb-4 scrollbar-thin scrollbar-thumb-zinc-800">
+                        {plannedMangaShelf.map((m) => {
+                          return (
+                            <div
+                              key={m.id}
+                              onClick={() => setActiveManga(m)}
+                              className="w-32 md:w-36 shrink-0 group relative cursor-pointer"
+                            >
+                              <div className="h-44 md:h-48 rounded-xl overflow-hidden relative border border-zinc-800/80 bg-zinc-900">
+                                {m.coverUrl ? (
+                                  <img src={m.coverUrl} alt={m.title} className="w-full h-full object-cover transition-transform group-hover:scale-105" referrerPolicy="no-referrer" />
+                                ) : (
+                                  <div className="w-full h-full flex items-center justify-center text-zinc-700 bg-[#121212] font-bold">📖</div>
+                                )}
+                                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-2">
+                                  <span className="text-[9px] text-zinc-400 font-mono uppercase font-bold">Start Reading</span>
+                                </div>
+                              </div>
+                              <h4 className="mt-2 font-bold uppercase text-[10px] tracking-wide line-clamp-1 text-[#EAD9C6] group-hover:text-[#D98A6C] transition-colors">{m.title}</h4>
+                              <p className="text-[9px] text-zinc-500 font-mono mt-0.5">{m.author || "Unknown"}</p>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Shelves 4: RECENTLY ADDED */}
+                  {recentlyAddedMangaShelf.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex justify-between items-center border-b border-[#27272A]/30 pb-2">
+                        <h3 className="text-[10px] font-bold tracking-widest uppercase text-zinc-400 font-mono flex items-center gap-1.5">
+                          <span className="w-2 h-2 rounded-full bg-indigo-500" /> Recently Ingested ({dataset.manga.length})
+                        </h3>
+                      </div>
+                      <div className="flex gap-4 overflow-x-auto pb-4 scrollbar-thin scrollbar-thumb-zinc-800">
+                        {recentlyAddedMangaShelf.map((m) => {
+                          return (
+                            <div
+                              key={m.id}
+                              onClick={() => setActiveManga(m)}
+                              className="w-32 md:w-36 shrink-0 group relative cursor-pointer"
+                            >
+                              <div className="h-44 md:h-48 rounded-xl overflow-hidden relative border border-zinc-800/80 bg-zinc-900">
+                                {m.coverUrl ? (
+                                  <img src={m.coverUrl} alt={m.title} className="w-full h-full object-cover transition-transform group-hover:scale-105" referrerPolicy="no-referrer" />
+                                ) : (
+                                  <div className="w-full h-full flex items-center justify-center text-zinc-700 bg-[#121212] font-bold">📖</div>
+                                )}
+                              </div>
+                              <h4 className="mt-2 font-bold uppercase text-[10px] tracking-wide line-clamp-1 text-[#EAD9C6] group-hover:text-[#D98A6C] transition-colors">{m.title}</h4>
+                              <p className="text-[9px] text-zinc-500 font-mono mt-0.5">Added {formatTimeAgo(m.addedDate)}</p>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Shelves 5: COMPLETED */}
+                  {completedMangaShelf.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex justify-between items-center border-b border-[#27272A]/30 pb-2">
+                        <h3 className="text-[10px] font-bold tracking-widest uppercase text-zinc-400 font-mono flex items-center gap-1.5">
+                          <span className="w-2 h-2 rounded-full bg-emerald-500" /> Completed Shelves ({completedMangaShelf.length})
+                        </h3>
+                      </div>
+                      <div className="flex gap-4 overflow-x-auto pb-4 scrollbar-thin scrollbar-thumb-zinc-800">
+                        {completedMangaShelf.map((m) => {
+                          return (
+                            <div
+                              key={m.id}
+                              onClick={() => setActiveManga(m)}
+                              className="w-32 md:w-36 shrink-0 group relative cursor-pointer"
+                            >
+                              <div className="h-44 md:h-48 rounded-xl overflow-hidden relative border border-zinc-800/80 bg-zinc-900">
+                                {m.coverUrl ? (
+                                  <img src={m.coverUrl} alt={m.title} className="w-full h-full object-cover transition-transform group-hover:scale-105" referrerPolicy="no-referrer" />
+                                ) : (
+                                  <div className="w-full h-full flex items-center justify-center text-zinc-700 bg-[#121212] font-bold">📖</div>
+                                )}
+                                <span className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded bg-emerald-600 text-white text-[8px] font-mono font-bold">
+                                  ★ Done
+                                </span>
+                              </div>
+                              <h4 className="mt-2 font-bold uppercase text-[10px] tracking-wide line-clamp-1 text-[#EAD9C6] group-hover:text-[#D98A6C] transition-colors">{m.title}</h4>
+                              <p className="text-[9px] text-zinc-500 font-mono mt-0.5">Finished {formatTimeAgo(m.lastRead || m.addedDate)}</p>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                </div>
+              )}
+
+            </section>
+
+            {/* Section 5: SECONDARY ANALYTICS */}
+            <section className="space-y-6">
+              <div className="flex items-center gap-2 border-b border-[#27272A]/40 pb-2">
+                <span className="w-2 h-2 rounded-full bg-[#D98A6C]" />
+                <h2 className="text-[10px] font-bold tracking-widest uppercase text-zinc-400 font-mono">Secondary Core Analytics</h2>
               </div>
-            )}
-          </section>
 
-          {/* Heatmap Section */}
-          <section>
-            <ReadingHeatmap dataset={dataset} />
-          </section>
+              {showDeepAnalytics ? (
+                <div className="space-y-8 animate-fade-in">
+                  {/* Heatmap Section */}
+                  <div className="bg-[#161618] border border-[#27272A] rounded-2xl p-5 shadow-sm">
+                    <ReadingHeatmap dataset={dataset} />
+                  </div>
 
-          {/* Deep analytics & charts graphs */}
-          <section id="analytics-charts" className="space-y-6 pt-2">
-            <div className="flex items-center gap-2 mb-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-[#D98A6C]" />
-              <h2 className="text-sm font-bold tracking-widest uppercase text-zinc-400 font-mono">Analytics Suite</h2>
-            </div>
-            
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              <div className="lg:col-span-2">
-                <AnalyticsOverview dataset={dataset} />
-              </div>
-              <div>
-                <TimeOfDayChart dataset={dataset} />
-              </div>
-            </div>
+                  {/* Deep charts graphs */}
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <div className="lg:col-span-2">
+                      <AnalyticsOverview dataset={dataset} />
+                    </div>
+                    <div>
+                      <TimeOfDayChart dataset={dataset} />
+                    </div>
+                  </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <TitleCompareMatrix dataset={dataset} />
-              <BackupPayloadChart dataset={dataset} />
-            </div>
-          </section>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <TitleCompareMatrix dataset={dataset} />
+                    <BackupPayloadChart dataset={dataset} />
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-[#161618] border border-[#27272A] rounded-2xl p-8 text-center space-y-3 font-mono">
+                  <Sparkles className="w-8 h-8 text-[#D98A6C]/80 mx-auto animate-pulse" />
+                  <h3 className="font-bold text-[#EAD9C6] text-xs uppercase tracking-wider">Velocity Analysis & Reading Patterns</h3>
+                  <p className="text-zinc-500 text-[10px] max-w-md mx-auto leading-relaxed">
+                    You need at least 20 chapters of logged reading history before deep velocity trends, heatmaps, and pattern analytics become active. Continue reading and updating logs to unlock!
+                  </p>
+                </div>
+              )}
+            </section>
 
+          </div>
         </main>
 
       </div>
@@ -1160,6 +1411,7 @@ export default function App() {
         onSaveRepo={handleSaveRepo}
         githubFilepath={githubFilepath}
         onSaveFilepath={handleSaveFilepath}
+        rawBackup={rawBackup}
       />
 
       {/* AI Assistant drawer */}
@@ -1179,6 +1431,8 @@ export default function App() {
           onSaveManga={handleSaveManga}
           onUpdateProgress={handleUpdateProgress}
           onDeleteManga={handleDeleteManga}
+          allManga={dataset.manga}
+          onSelectManga={setActiveManga}
         />
       )}
 

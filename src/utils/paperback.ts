@@ -101,6 +101,12 @@ export function normalizeEpoch(val: any): number {
   return Math.floor(val);
 }
 
+let lastRawBackup: { librarymanga: any; sourcemanga: any; mangainfo: any } | null = null;
+
+export function getLastRawBackup(): { librarymanga: any; sourcemanga: any; mangainfo: any } | null {
+  return lastRawBackup;
+}
+
 /**
  * Parses and merges raw Paperback backup bytes (.pas4 / .paperback / .json) into a db.json model.
  */
@@ -134,6 +140,12 @@ export async function parsePaperbackBackup(fileBuffer: ArrayBuffer): Promise<DBD
         const mangaInfoJSON = JSON.parse(textDecoder.decode(decompressed[mangaInfoKey]));
         const libraryJSON = JSON.parse(textDecoder.decode(decompressed[libraryKey]));
         
+        lastRawBackup = {
+          librarymanga: libraryJSON,
+          sourcemanga: sourceMangaJSON,
+          mangainfo: mangaInfoJSON,
+        };
+
         let progressJSON: any = {};
         if (progressKey && decompressed[progressKey]) {
           try {

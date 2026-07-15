@@ -52,6 +52,7 @@ export interface AppSettings {
 export interface SizeHistoryItem {
   timestamp: number;
   sizeKB: number;
+  sizeInBytes?: number;
 }
 
 export interface SyncMetadata {

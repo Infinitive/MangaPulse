@@ -3,7 +3,9 @@ import { DBDataset, AppSettings, ErrorLog, SyncStatus } from "../types";
 import { testGitHubConnection, createGitHubRepository } from "../utils/github";
 import { encryptText, decryptText } from "../utils/crypto";
 import { getErrorLogs, clearErrorLogs } from "../utils/db";
-import { Settings, Lock, Unlock, Key, Github, RefreshCw, Sliders, AlertCircle, FileJson, Trash2, X } from "lucide-react";
+import { generateWidgetPayload } from "../utils/analytics";
+import { JSONInspector } from "./JSONInspector";
+import { Settings, Lock, Unlock, Key, Github, RefreshCw, Sliders, AlertCircle, FileJson, Trash2, X, Shield, Terminal } from "lucide-react";
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -18,6 +20,7 @@ interface SettingsModalProps {
   onSaveRepo: (repo: string) => void;
   githubFilepath: string;
   onSaveFilepath: (path: string) => void;
+  rawBackup?: { librarymanga: any; sourcemanga: any; mangainfo: any } | null;
 }
 
 export function SettingsModal({
@@ -32,8 +35,10 @@ export function SettingsModal({
   onSaveRepo,
   githubFilepath,
   onSaveFilepath,
+  rawBackup = null,
 }: SettingsModalProps) {
   // Passphrase flow
+  const [activeTab, setActiveTab] = useState<"user" | "sync" | "advanced">("user");
   const [passphrase, setPassphrase] = useState("");
   const [rawPat, setRawPat] = useState("");
   const [isPatDecrypted, setIsPatDecrypted] = useState(false);
@@ -212,285 +217,362 @@ export function SettingsModal({
     downloadAnchor.remove();
   };
 
+  const handleWidgetExport = () => {
+    const payload = generateWidgetPayload(dataset);
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(payload, null, 2));
+    const downloadAnchor = document.createElement("a");
+    downloadAnchor.setAttribute("href", dataStr);
+    downloadAnchor.setAttribute("download", "widget.json");
+    document.body.appendChild(downloadAnchor);
+    downloadAnchor.click();
+    downloadAnchor.remove();
+  };
+
   return (
     <div className="fixed inset-0 bg-black/75 z-50 flex items-center justify-center p-4 overflow-y-auto">
-      <div className="bg-[#161618] border border-[#27272A] w-full max-w-lg rounded-2xl flex flex-col max-h-[90vh] text-xs text-[#EAD9C6]">
+      <div className="bg-[#161618] border border-[#27272A] w-full max-w-xl rounded-2xl flex flex-col max-h-[90vh] text-xs text-[#EAD9C6] shadow-2xl">
         {/* Header */}
         <div className="p-4 border-b border-[#27272A] flex justify-between items-center bg-[#121212] rounded-t-2xl">
           <div className="flex items-center gap-2">
             <Settings className="w-4 h-4 text-[#D98A6C]" />
-            <h2 className="font-extrabold uppercase tracking-wide">MangaPulse Settings Console</h2>
+            <h2 className="font-extrabold uppercase tracking-widest font-mono text-xs">MangaPulse Control Desk</h2>
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 hover:bg-[#27272A] rounded-md text-zinc-400 hover:text-[#EAD9C6] transition-colors"
+            className="p-1.5 hover:bg-[#27272A] rounded-md text-zinc-400 hover:text-[#EAD9C6] transition-colors cursor-pointer"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
+        {/* Tab Navigation */}
+        <div className="flex border-b border-[#27272A] bg-[#121212] px-2">
+          <button
+            onClick={() => setActiveTab("user")}
+            className={`flex items-center gap-2 px-4 py-3 font-semibold text-[11px] uppercase tracking-wider font-mono border-b-2 transition-all cursor-pointer ${
+              activeTab === "user"
+                ? "border-[#D98A6C] text-[#D98A6C] bg-[#161618]/50"
+                : "border-transparent text-zinc-400 hover:text-zinc-200"
+            }`}
+          >
+            <Sliders className="w-3.5 h-3.5" />
+            User Settings
+          </button>
+          <button
+            onClick={() => setActiveTab("sync")}
+            className={`flex items-center gap-2 px-4 py-3 font-semibold text-[11px] uppercase tracking-wider font-mono border-b-2 transition-all cursor-pointer ${
+              activeTab === "sync"
+                ? "border-[#D98A6C] text-[#D98A6C] bg-[#161618]/50"
+                : "border-transparent text-zinc-400 hover:text-zinc-200"
+            }`}
+          >
+            <Github className="w-3.5 h-3.5" />
+            Sync Settings
+          </button>
+          <button
+            onClick={() => setActiveTab("advanced")}
+            className={`flex items-center gap-2 px-4 py-3 font-semibold text-[11px] uppercase tracking-wider font-mono border-b-2 transition-all cursor-pointer ${
+              activeTab === "advanced"
+                ? "border-[#D98A6C] text-[#D98A6C] bg-[#161618]/50"
+                : "border-transparent text-zinc-400 hover:text-zinc-200"
+            }`}
+          >
+            <Terminal className="w-3.5 h-3.5" />
+            Advanced Tools
+          </button>
+        </div>
+
         {/* Modal body (Scrollable) */}
-        <div className="p-5 flex-1 overflow-y-auto space-y-6 scrollbar-thin scrollbar-thumb-zinc-800">
-          
-          {/* GitHub PAT Secure Management */}
-          <div className="space-y-3 bg-[#121212] p-4 rounded-xl border border-[#27272A]">
-            <h3 className="font-bold uppercase tracking-wider text-[10px] text-zinc-400 flex items-center gap-1">
-              <Lock className="w-3.5 h-3.5 text-[#D98A6C]" /> Secure GitHub PAT Storage (AES-256)
-            </h3>
+        <div className="p-5 flex-1 overflow-y-auto space-y-5 scrollbar-thin scrollbar-thumb-zinc-800">
+          {activeTab === "user" && (
+            <div className="space-y-4 animate-fade-in">
+              <div className="space-y-4 bg-[#121212] p-5 rounded-xl border border-[#27272A]">
+                <h3 className="font-bold uppercase tracking-wider text-[10px] text-zinc-400 flex items-center gap-1.5 font-mono">
+                  <Sliders className="w-3.5 h-3.5 text-[#D98A6C]" /> Threshold Benchmarks
+                </h3>
 
-            <div className="space-y-2">
-              <label className="block text-[10px] text-zinc-500 uppercase tracking-wide">Security Passphrase</label>
-              <input
-                type="password"
-                value={passphrase}
-                onChange={(e) => setPassphrase(e.target.value)}
-                placeholder="Passphrase to encrypt/decrypt Token..."
-                className="w-full bg-[#161618] border border-[#27272A] rounded px-3 py-1.5 text-xs text-[#EAD9C6] placeholder-zinc-600 focus:outline-none focus:border-[#D98A6C]"
-              />
-            </div>
+                {/* Stall threshold days */}
+                <div className="space-y-2">
+                  <div className="flex justify-between font-medium font-mono text-[10px]">
+                    <span className="text-zinc-400">STALL THRESHOLD:</span>
+                    <span className="text-[#D98A6C] font-semibold">{stallThresholdDays} DAYS</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={3}
+                    max={60}
+                    value={stallThresholdDays}
+                    onChange={(e) => setStallThresholdDays(parseInt(e.target.value, 10))}
+                    className="w-full accent-[#D98A6C] cursor-pointer"
+                  />
+                  <p className="text-[9px] text-zinc-500 italic">Manga series unread longer than this timeframe will decay to the "Stalled" bucket.</p>
+                </div>
 
-            {encryptedPat && !isPatDecrypted ? (
-              <div className="pt-2 flex gap-2">
-                <button
-                  onClick={handleDecryptPAT}
-                  className="flex items-center justify-center gap-1 px-3 py-1.5 bg-[#27272A] hover:bg-[#D98A6C] text-zinc-300 hover:text-[#121212] rounded font-semibold border border-transparent transition-all cursor-pointer"
-                >
-                  <Unlock className="w-3.5 h-3.5" /> Decrypt Stored Token
-                </button>
-                <div className="text-[10px] text-zinc-500 self-center">⚠️ Saved PAT is encrypted. Decrypt first to test or edit.</div>
+                {/* Binge threshold hours */}
+                <div className="space-y-2 pt-2 border-t border-[#27272A]/30">
+                  <div className="flex justify-between font-medium font-mono text-[10px]">
+                    <span className="text-zinc-400">BINGE DETECTION WINDOW:</span>
+                    <span className="text-[#D98A6C] font-semibold">{bingeThresholdHours} HOURS</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={12}
+                    max={96}
+                    value={bingeThresholdHours}
+                    onChange={(e) => setBingeThresholdHours(parseInt(e.target.value, 10))}
+                    className="w-full accent-[#D98A6C] cursor-pointer"
+                  />
+                  <p className="text-[9px] text-zinc-500 italic">Rolling chronological timeframe used to measure rapid reading velocities.</p>
+                </div>
               </div>
-            ) : (
-              <div className="space-y-3 pt-2">
-                <div>
-                  <label className="block text-[10px] text-zinc-500 uppercase tracking-wide mb-1">GitHub Personal Access Token (PAT)</label>
+
+              <div className="space-y-4 bg-[#121212] p-5 rounded-xl border border-[#27272A]">
+                <h3 className="font-bold uppercase tracking-wider text-[10px] text-zinc-400 flex items-center gap-1.5 font-mono">
+                  <Shield className="w-3.5 h-3.5 text-[#D98A6C]" /> Difficulty Parameters
+                </h3>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-1">
+                    <span className="block text-[10px] text-zinc-500 uppercase font-bold font-mono">Easy Chapters Limit</span>
+                    <input
+                      type="number"
+                      value={easyThreshold}
+                      onChange={(e) => setEasyThreshold(parseInt(e.target.value, 10) || 50)}
+                      className="w-full bg-[#161618] border border-[#27272A] rounded px-2.5 py-1.5 text-xs text-[#EAD9C6] focus:outline-none focus:border-[#D98A6C] font-mono"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <span className="block text-[10px] text-zinc-500 uppercase font-bold font-mono">Medium Chapters Limit</span>
+                    <input
+                      type="number"
+                      value={mediumThreshold}
+                      onChange={(e) => setMediumThreshold(parseInt(e.target.value, 10) || 200)}
+                      className="w-full bg-[#161618] border border-[#27272A] rounded px-2.5 py-1.5 text-xs text-[#EAD9C6] focus:outline-none focus:border-[#D98A6C] font-mono"
+                    />
+                  </div>
+                </div>
+                <p className="text-[9px] text-zinc-500 italic">These chapter counts determine whether a title is classified as low, medium, or high difficulty.</p>
+              </div>
+            </div>
+          )}
+
+          {activeTab === "sync" && (
+            <div className="space-y-4 animate-fade-in">
+              {/* GitHub PAT Secure Management */}
+              <div className="space-y-3 bg-[#121212] p-4 rounded-xl border border-[#27272A]">
+                <h3 className="font-bold uppercase tracking-wider text-[10px] text-zinc-400 flex items-center gap-1.5 font-mono">
+                  <Lock className="w-3.5 h-3.5 text-[#D98A6C]" /> Cryptographic GitHub Access (AES-256)
+                </h3>
+
+                <div className="space-y-2">
+                  <label className="block text-[10px] text-zinc-500 uppercase tracking-wide font-mono">Security Passphrase</label>
                   <input
                     type="password"
-                    value={rawPat}
-                    onChange={(e) => setRawPat(e.target.value)}
-                    placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxx..."
-                    className="w-full bg-[#161618] border border-[#27272A] rounded px-3 py-1.5 text-xs text-[#EAD9C6] placeholder-zinc-600 focus:outline-none focus:border-[#D98A6C] font-mono"
+                    value={passphrase}
+                    onChange={(e) => setPassphrase(e.target.value)}
+                    placeholder="Enter decryption/encryption passphrase..."
+                    className="w-full bg-[#161618] border border-[#27272A] rounded px-3 py-1.5 text-xs text-[#EAD9C6] placeholder-zinc-600 focus:outline-none focus:border-[#D98A6C]"
                   />
                 </div>
-                <button
-                  onClick={handleEncryptAndSavePAT}
-                  className="px-3 py-1.5 bg-[#D98A6C] hover:bg-[#e4a085] text-[#121212] rounded font-bold transition-colors cursor-pointer"
-                >
-                  Encrypt & Save to LocalStorage
-                </button>
+
+                {encryptedPat && !isPatDecrypted ? (
+                  <div className="pt-2 flex flex-col gap-2">
+                    <button
+                      onClick={handleDecryptPAT}
+                      className="flex items-center justify-center gap-1.5 px-3 py-2 bg-[#27272A] hover:bg-[#D98A6C] text-zinc-300 hover:text-[#121212] rounded font-bold border border-transparent transition-all cursor-pointer font-mono text-[10px] uppercase"
+                    >
+                      <Unlock className="w-3.5 h-3.5" /> Decrypt Key Credentials
+                    </button>
+                    <div className="text-[9px] text-zinc-500 italic">⚠️ The GitHub Personal Access Token is saved encrypted. Unlock it to enable synchronizations or modify files.</div>
+                  </div>
+                ) : (
+                  <div className="space-y-3 pt-2">
+                    <div>
+                      <label className="block text-[10px] text-zinc-500 uppercase tracking-wide mb-1 font-mono">GitHub Personal Access Token (PAT)</label>
+                      <input
+                        type="password"
+                        value={rawPat}
+                        onChange={(e) => setRawPat(e.target.value)}
+                        placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxx..."
+                        className="w-full bg-[#161618] border border-[#27272A] rounded px-3 py-1.5 text-xs text-[#EAD9C6] placeholder-zinc-600 focus:outline-none focus:border-[#D98A6C] font-mono"
+                      />
+                    </div>
+                    <button
+                      onClick={handleEncryptAndSavePAT}
+                      className="px-3 py-1.5 bg-[#D98A6C] hover:bg-[#e4a085] text-[#121212] rounded font-bold transition-colors cursor-pointer font-mono uppercase text-[10px]"
+                    >
+                      Encrypt & Save credentials
+                    </button>
+                  </div>
+                )}
               </div>
-            )}
-          </div>
 
-          {/* Repository synchronization */}
-          <div className="space-y-3 bg-[#121212] p-4 rounded-xl border border-[#27272A]">
-            <h3 className="font-bold uppercase tracking-wider text-[10px] text-zinc-400 flex items-center gap-1">
-              <Github className="w-3.5 h-3.5 text-[#D98A6C]" /> Target private Repository
-            </h3>
-            
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-[10px] text-zinc-500 mb-1">Repository Name (owner/repo)</label>
-                <input
-                  type="text"
-                  value={repoInput}
-                  onChange={(e) => setRepoInput(e.target.value)}
-                  placeholder="johndoe/manga-backup"
-                  className="w-full bg-[#161618] border border-[#27272A] rounded px-3 py-1.5 text-xs text-[#EAD9C6] focus:outline-none focus:border-[#D98A6C]"
-                />
-              </div>
-              <div>
-                <label className="block text-[10px] text-zinc-500 mb-1">File Target (e.g. db.json)</label>
-                <input
-                  type="text"
-                  value={filepathInput}
-                  onChange={(e) => setFilepathInput(e.target.value)}
-                  placeholder="db.json"
-                  className="w-full bg-[#161618] border border-[#27272A] rounded px-3 py-1.5 text-xs text-[#EAD9C6] focus:outline-none focus:border-[#D98A6C]"
-                />
-              </div>
-            </div>
+              {/* Repository synchronization */}
+              <div className="space-y-3 bg-[#121212] p-4 rounded-xl border border-[#27272A]">
+                <h3 className="font-bold uppercase tracking-wider text-[10px] text-zinc-400 flex items-center gap-1.5 font-mono">
+                  <Github className="w-3.5 h-3.5 text-[#D98A6C]" /> Cloud Data Repository Sync
+                </h3>
+                
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[10px] text-zinc-500 mb-1 font-mono">Repository (owner/repo)</label>
+                    <input
+                      type="text"
+                      value={repoInput}
+                      onChange={(e) => setRepoInput(e.target.value)}
+                      placeholder="johndoe/manga-backup"
+                      className="w-full bg-[#161618] border border-[#27272A] rounded px-3 py-1.5 text-xs text-[#EAD9C6] focus:outline-none focus:border-[#D98A6C]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] text-zinc-500 mb-1 font-mono">File Path (e.g. db.json)</label>
+                    <input
+                      type="text"
+                      value={filepathInput}
+                      onChange={(e) => setFilepathInput(e.target.value)}
+                      placeholder="db.json"
+                      className="w-full bg-[#161618] border border-[#27272A] rounded px-3 py-1.5 text-xs text-[#EAD9C6] focus:outline-none focus:border-[#D98A6C]"
+                    />
+                  </div>
+                </div>
 
-            <div className="pt-2 flex flex-wrap gap-2">
-              <button
-                onClick={handleTestConnection}
-                disabled={testing || creatingRepo}
-                className="flex items-center justify-center gap-1.5 px-3 py-1.5 bg-[#27272A] hover:bg-[#202022] rounded font-semibold border border-[#27272A] text-[#EAD9C6] hover:text-white transition-all disabled:opacity-50 cursor-pointer"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${testing ? "animate-spin" : ""}`} />
-                Test Connection Diagnostics
-              </button>
-
-              <button
-                onClick={handleCreateRepo}
-                disabled={testing || creatingRepo}
-                className="flex items-center justify-center gap-1.5 px-3 py-1.5 bg-[#D98A6C]/20 hover:bg-[#D98A6C]/30 text-[#D98A6C] rounded font-semibold border border-[#D98A6C]/40 hover:border-[#D98A6C]/60 transition-all disabled:opacity-50 cursor-pointer"
-              >
-                <Github className={`w-3.5 h-3.5 ${creatingRepo ? "animate-pulse" : ""}`} />
-                Create Private Repository
-              </button>
-            </div>
-
-            {testResult && (
-              <div
-                className={`p-3 rounded-lg border text-[11px] leading-relaxed flex gap-2 ${
-                  testResult.success
-                    ? "bg-green-950/20 border-green-500/30 text-green-300"
-                    : "bg-red-950/20 border-red-500/30 text-red-300"
-                }`}
-              >
-                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                <p>{testResult.message}</p>
-              </div>
-            )}
-          </div>
-
-          {/* Threshold sliders */}
-          <div className="space-y-4 bg-[#121212] p-4 rounded-xl border border-[#27272A]">
-            <h3 className="font-bold uppercase tracking-wider text-[10px] text-zinc-400 flex items-center gap-1">
-              <Sliders className="w-3.5 h-3.5 text-[#D98A6C]" /> Threshold Sliders
-            </h3>
-
-            {/* Stall threshold days */}
-            <div className="space-y-1">
-              <div className="flex justify-between font-medium">
-                <span className="text-zinc-400">Stall Threshold:</span>
-                <span className="text-[#D98A6C] font-semibold">{stallThresholdDays} days</span>
-              </div>
-              <input
-                type="range"
-                min={3}
-                max={60}
-                value={stallThresholdDays}
-                onChange={(e) => setStallThresholdDays(parseInt(e.target.value, 10))}
-                className="w-full accent-[#D98A6C] cursor-pointer"
-              />
-              <p className="text-[9px] text-zinc-500">Manga with lastRead older than this are flagged as stalled.</p>
-            </div>
-
-            {/* Binge threshold hours */}
-            <div className="space-y-1 pt-2">
-              <div className="flex justify-between font-medium">
-                <span className="text-zinc-400">Binge Session window:</span>
-                <span className="text-[#D98A6C] font-semibold">{bingeThresholdHours} hours</span>
-              </div>
-              <input
-                type="range"
-                min={12}
-                max={96}
-                value={bingeThresholdHours}
-                onChange={(e) => setBingeThresholdHours(parseInt(e.target.value, 10))}
-                className="w-full accent-[#D98A6C] cursor-pointer"
-              />
-              <p className="text-[9px] text-zinc-500">Hourly timeframe used to identify contiguous reading streaks.</p>
-            </div>
-
-            {/* Difficulty benchmarks */}
-            <div className="grid grid-cols-2 gap-4 pt-2">
-              <div className="space-y-1">
-                <span className="block text-[10px] text-zinc-500 uppercase font-semibold">Easy Difficulty ceiling</span>
-                <input
-                  type="number"
-                  value={easyThreshold}
-                  onChange={(e) => setEasyThreshold(parseInt(e.target.value, 10) || 50)}
-                  className="w-full bg-[#161618] border border-[#27272A] rounded px-2.5 py-1 text-[#EAD9C6] focus:outline-none focus:border-[#D98A6C]"
-                />
-              </div>
-              <div className="space-y-1">
-                <span className="block text-[10px] text-zinc-500 uppercase font-semibold">Medium Difficulty ceiling</span>
-                <input
-                  type="number"
-                  value={mediumThreshold}
-                  onChange={(e) => setMediumThreshold(parseInt(e.target.value, 10) || 200)}
-                  className="w-full bg-[#161618] border border-[#27272A] rounded px-2.5 py-1 text-[#EAD9C6] focus:outline-none focus:border-[#D98A6C]"
-                />
-              </div>
-            </div>
-          </div>
-
-          {/* Local storage import/export */}
-          <div className="space-y-3 bg-[#121212] p-4 rounded-xl border border-[#27272A]">
-            <h3 className="font-bold uppercase tracking-wider text-[10px] text-zinc-400 flex items-center gap-1">
-              <FileJson className="w-3.5 h-3.5 text-[#D98A6C]" /> Raw JSON Backup Panel
-            </h3>
-            <p className="text-[10px] text-zinc-500">Test or import/export raw db.json payloads locally without GitHub APIs active.</p>
-            
-            <div className="flex gap-2.5 pt-1.5">
-              <label className="flex items-center justify-center gap-1.5 px-3 py-2 bg-[#27272A] hover:bg-zinc-800 border border-[#27272A] text-zinc-300 hover:text-white rounded font-semibold text-center cursor-pointer flex-1 transition-colors">
-                <FileJson className="w-3.5 h-3.5" /> Import JSON Backup
-                <input
-                  type="file"
-                  accept=".json"
-                  onChange={handleJSONImport}
-                  className="hidden"
-                />
-              </label>
-              <button
-                onClick={handleJSONExport}
-                className="flex items-center justify-center gap-1.5 px-3 py-2 bg-[#27272A] hover:bg-zinc-800 border border-[#27272A] text-zinc-300 hover:text-white rounded font-semibold flex-1 transition-colors cursor-pointer"
-              >
-                <FileJson className="w-3.5 h-3.5" /> Export DB JSON
-              </button>
-            </div>
-          </div>
-
-          {/* Toggleable error console log drawer */}
-          <div className="space-y-2">
-            <button
-              onClick={() => {
-                setShowLogs(!showLogs);
-                if (!showLogs) loadLogs();
-              }}
-              className="text-[#D98A6C] font-semibold text-[11px] underline flex items-center gap-1 hover:text-[#e4a085] cursor-pointer"
-            >
-              <Sliders className="w-3 h-3" /> {showLogs ? "Hide" : "Show"} System Error & Diagnostic Log Console
-            </button>
-
-            {showLogs && (
-              <div className="bg-[#121212] border border-[#27272A] rounded-xl p-3 space-y-3 max-h-48 overflow-y-auto font-mono text-[10px]">
-                <div className="flex justify-between items-center pb-1.5 border-b border-[#27272A]">
-                  <span className="font-bold text-zinc-400">DIAGNOSTIC LOG RECORDS</span>
+                <div className="pt-2 flex flex-wrap gap-2">
                   <button
-                    onClick={handleClearLogs}
-                    className="flex items-center gap-1 text-red-400 hover:text-red-300 cursor-pointer"
+                    onClick={handleTestConnection}
+                    disabled={testing || creatingRepo}
+                    className="flex items-center justify-center gap-1.5 px-3 py-1.5 bg-[#27272A] hover:bg-[#202022] rounded font-semibold border border-[#27272A] text-[#EAD9C6] hover:text-white transition-all disabled:opacity-50 cursor-pointer text-[10px] font-mono uppercase"
                   >
-                    <Trash2 className="w-3 h-3" /> Clear logs
+                    <RefreshCw className={`w-3 h-3 ${testing ? "animate-spin" : ""}`} />
+                    Test Sync Connection
+                  </button>
+
+                  <button
+                    onClick={handleCreateRepo}
+                    disabled={testing || creatingRepo}
+                    className="flex items-center justify-center gap-1.5 px-3 py-1.5 bg-[#D98A6C]/20 hover:bg-[#D98A6C]/30 text-[#D98A6C] rounded font-semibold border border-[#D98A6C]/40 hover:border-[#D98A6C]/60 transition-all disabled:opacity-50 cursor-pointer text-[10px] font-mono uppercase"
+                  >
+                    <Github className={`w-3 h-3 ${creatingRepo ? "animate-pulse" : ""}`} />
+                    Initialize Private Repo
                   </button>
                 </div>
+
+                {testResult && (
+                  <div
+                    className={`p-3 rounded-lg border text-[10px] leading-relaxed flex gap-2 ${
+                      testResult.success
+                        ? "bg-green-950/20 border-green-500/30 text-green-300"
+                        : "bg-red-950/20 border-red-500/30 text-red-300"
+                    }`}
+                  >
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                    <p>{testResult.message}</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {activeTab === "advanced" && (
+            <div className="space-y-4 animate-fade-in">
+              {/* Local storage import/export */}
+              <div className="space-y-3 bg-[#121212] p-4 rounded-xl border border-[#27272A]">
+                <h3 className="font-bold uppercase tracking-wider text-[10px] text-zinc-400 flex items-center gap-1.5 font-mono">
+                  <FileJson className="w-3.5 h-3.5 text-[#D98A6C]" /> Database Payload Exporter & Importer
+                </h3>
+                <p className="text-[10px] text-zinc-500 italic">Backup or restore raw db.json files manually in case of offline environments.</p>
+                
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1.5">
+                  <label className="flex items-center justify-center gap-1.5 px-3 py-2 bg-[#27272A] hover:bg-zinc-800 border border-[#27272A] text-zinc-300 hover:text-white rounded font-semibold text-center cursor-pointer transition-colors text-[10px] font-mono uppercase">
+                    <FileJson className="w-3.5 h-3.5 shrink-0" /> <span className="truncate">Import JSON</span>
+                    <input
+                      type="file"
+                      accept=".json"
+                      onChange={handleJSONImport}
+                      className="hidden"
+                    />
+                  </label>
+                  <button
+                    onClick={handleJSONExport}
+                    className="flex items-center justify-center gap-1.5 px-3 py-2 bg-[#27272A] hover:bg-zinc-800 border border-[#27272A] text-zinc-300 hover:text-white rounded font-semibold transition-colors cursor-pointer text-[10px] font-mono uppercase"
+                  >
+                    <FileJson className="w-3.5 h-3.5 shrink-0" /> <span className="truncate">Export JSON</span>
+                  </button>
+                  <button
+                    onClick={handleWidgetExport}
+                    className="flex items-center justify-center gap-1.5 px-3 py-2 bg-[#27272A] hover:bg-[#D98A6C] hover:text-[#121212] border border-[#27272A] text-[#D98A6C] rounded font-semibold transition-colors cursor-pointer text-[10px] font-mono uppercase"
+                  >
+                    <Sliders className="w-3.5 h-3.5 shrink-0" /> <span className="truncate">Widget JSON</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* System log diagnostics */}
+              <div className="space-y-3 bg-[#121212] p-4 rounded-xl border border-[#27272A]">
+                <div className="flex justify-between items-center border-b border-[#27272A]/40 pb-2">
+                  <h3 className="font-bold uppercase tracking-wider text-[10px] text-zinc-400 flex items-center gap-1.5 font-mono">
+                    <Terminal className="w-3.5 h-3.5 text-[#D98A6C]" /> System Error & Diagnostics Log
+                  </h3>
+                  {logs.length > 0 && (
+                    <button
+                      onClick={handleClearLogs}
+                      className="flex items-center gap-1 text-[10px] font-mono text-red-400 hover:text-red-300 cursor-pointer uppercase font-bold"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" /> Clear
+                    </button>
+                  )}
+                </div>
                 {logs.length === 0 ? (
-                  <p className="text-zinc-600 italic text-center py-4">No diagnostic logs generated yet.</p>
+                  <p className="text-zinc-600 italic py-2">No diagnostics logs registered. Systems fully functional.</p>
                 ) : (
-                  <div className="space-y-2 divide-y divide-[#27272A]/30">
+                  <div className="bg-[#161618] border border-[#27272A] rounded-lg p-2.5 max-h-36 overflow-y-auto font-mono text-[9px] text-zinc-400 space-y-1.5">
                     {logs.map((l, i) => (
-                      <div key={i} className="pt-2">
+                      <div key={i} className="leading-normal">
                         <span className="text-zinc-500">[{new Date(l.timestamp * 1000).toLocaleTimeString()}]</span>{" "}
-                        <span className="font-semibold uppercase text-zinc-400">({l.type})</span>:{" "}
-                        <span className="text-zinc-300">{l.message}</span>
+                        <span className="text-amber-500 uppercase font-semibold">{l.type}</span>: {l.message}
                       </div>
                     ))}
                   </div>
                 )}
               </div>
-            )}
-          </div>
 
+              {/* Ingestion Relational Inspector */}
+              <div className="space-y-3 bg-[#121212] p-4 rounded-xl border border-[#27272A]">
+                <h3 className="font-bold uppercase tracking-wider text-[10px] text-zinc-400 flex items-center gap-1.5 font-mono">
+                  <Sliders className="w-3.5 h-3.5 text-[#D98A6C]" /> Paperback Ingestion Schema Inspector
+                </h3>
+                {rawBackup ? (
+                  <div className="border border-[#27272A] rounded-xl overflow-hidden bg-[#161618] p-3 max-h-64 overflow-y-auto">
+                    <JSONInspector
+                      librarymanga={rawBackup.librarymanga}
+                      sourcemanga={rawBackup.sourcemanga}
+                      mangainfo={rawBackup.mangainfo}
+                    />
+                  </div>
+                ) : (
+                  <div className="text-center p-6 bg-[#161618] border border-[#27272A]/50 rounded-xl">
+                    <p className="text-zinc-500 italic">No Paperback .pas4 backup actively inspected in memory.</p>
+                    <p className="text-[10px] text-zinc-600 mt-1">Please upload/unzip a native .pas4 file on the workspace to populate this relational debugger.</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Footer actions */}
         <div className="p-4 border-t border-[#27272A] bg-[#121212] flex justify-end gap-2 rounded-b-2xl">
           <button
             onClick={onClose}
-            className="px-4 py-2 bg-[#27272A] hover:bg-zinc-800 rounded text-zinc-300 hover:text-white font-semibold transition-colors cursor-pointer"
+            className="px-4 py-2 bg-[#27272A] hover:bg-zinc-800 rounded text-zinc-300 hover:text-white font-semibold font-mono text-[10px] uppercase transition-colors cursor-pointer"
           >
             Cancel
           </button>
           <button
             onClick={handleSaveConfig}
-            className="px-4 py-2 bg-[#D98A6C] hover:bg-[#e4a085] text-[#121212] rounded font-bold transition-colors cursor-pointer"
+            className="px-4 py-2 bg-[#D98A6C] hover:bg-[#e4a085] text-[#121212] rounded font-bold font-mono text-[10px] uppercase transition-colors cursor-pointer"
           >
             Apply Configurations
           </button>
         </div>
-
       </div>
     </div>
   );

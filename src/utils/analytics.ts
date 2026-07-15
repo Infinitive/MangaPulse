@@ -1,4 +1,4 @@
-import { DBDataset, MangaEntry, LibraryEntry, ReadingHistoryItem } from "../types";
+import { DBDataset, MangaEntry, LibraryEntry, ReadingHistoryItem, AppSettings } from "../types";
 
 // Known hiatus titles for override
 export const HIATUS_TITLES = [
@@ -512,4 +512,157 @@ export function detectGhostProgress(mangaList: MangaEntry[], libraryList: Librar
   });
 
   return warnings;
+}
+
+/**
+ * Dead-End Recommendation Engine (Task 7):
+ * Locates up to three active/completed/highly-rated manga matching genres or authors
+ * for a dropped or stalled manga.
+ */
+export function getMangaRecommendations(target: MangaEntry, allManga: MangaEntry[]): MangaEntry[] {
+  if (!target) return [];
+  
+  const targetGenres = target.genres || [];
+  const targetAuthor = (target.author || "").trim().toLowerCase();
+  
+  // Candidates must not be the target, and should be highly rated or completed
+  const candidates = allManga.filter(
+    (m) => m.id !== target.id && (m.status === "completed" || m.rating >= 4)
+  );
+
+  const scored = candidates.map((m) => {
+    let score = 0;
+    
+    // Author match (avoid generic "unknown" matches)
+    const mAuthor = (m.author || "").trim().toLowerCase();
+    if (targetAuthor && mAuthor && mAuthor === targetAuthor && mAuthor !== "unknown author" && mAuthor !== "unknown") {
+      score += 10;
+    }
+    
+    // Genre match intersection
+    const mGenres = m.genres || [];
+    const intersection = mGenres.filter((g) => targetGenres.includes(g));
+    score += intersection.length * 3;
+    
+    // Rating bonus
+    score += m.rating || 0;
+    
+    return { manga: m, score };
+  });
+
+  // Sort by score descending and take top 3
+  return scored
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .map((s) => s.manga)
+    .slice(0, 3);
+}
+
+/**
+ * Task 1 and 2: Dynamic flags updater for Binge and Stalled logic
+ */
+export function updateMangaFlags(
+  mangaList: MangaEntry[],
+  libraryList: LibraryEntry[],
+  settings: AppSettings
+): MangaEntry[] {
+  const now = Math.floor(Date.now() / 1000);
+  const bingeThresholdHours = settings?.bingeThresholdHours || 48;
+  const bingeThresholdSecs = bingeThresholdHours * 3600;
+  const stallThresholdDays = settings?.stallThresholdDays || 14;
+  const stallThresholdSecs = stallThresholdDays * 24 * 3600;
+
+  // Velocity threshold for binge: let's default to 5 chapters in 48 hours
+  const bingeVelocityThreshold = 5;
+
+  return mangaList.map((m) => {
+    const lib = libraryList.find((l) => l.mangaId === m.id);
+    if (!lib) {
+      return { ...m, isBinge: false, isStalled: false };
+    }
+
+    // Task 1: 48-Hour Binge Engine
+    const history = lib.history || [];
+    const cutoff = now - bingeThresholdSecs;
+    const recentReads = history.filter(
+      (h) => h && typeof h.timestamp === "number" && h.timestamp >= cutoff && h.timestamp <= now
+    );
+    
+    // Calculate delta of completed chapters in the 48-hour window
+    const completedChaptersInWindow = new Set(recentReads.map((h) => h.chapter));
+    const isBinge = m.status === "reading" && completedChaptersInWindow.size >= bingeVelocityThreshold;
+
+    // Task 2: Threshold-Driven Stall Engine
+    const lastReadTimestamp = m.lastRead || m.addedDate || now;
+    const isStalled = m.status === "reading" && (now - lastReadTimestamp) > stallThresholdSecs;
+
+    return {
+      ...m,
+      isBinge,
+      isStalled,
+    };
+  });
+}
+
+/**
+ * Task 3: Client-Side Widget Data Provider
+ * Compiles a flat summary payload representing /api/widget.json schema
+ */
+export function generateWidgetPayload(dataset: DBDataset) {
+  const mangaList = dataset.manga || [];
+  const libraryList = dataset.library || [];
+
+  const activeManga = mangaList.filter((m) => m.status === "reading");
+  
+  const activeTitles = activeManga.map((m) => {
+    const lib = libraryList.find((l) => l.mangaId === m.id);
+    return {
+      title: m.title,
+      chaptersRead: lib ? lib.chaptersRead : 0,
+      totalChapters: m.totalChapters || 0,
+      lastRead: m.lastRead,
+    };
+  });
+
+  const totalReadingCounts = libraryList.reduce((acc, curr) => acc + (curr.chaptersRead || 0), 0);
+
+  const heatmapVector: Record<string, number> = {};
+  libraryList.forEach((lib) => {
+    (lib.history || []).forEach((hist) => {
+      if (hist && typeof hist.timestamp === "number") {
+        const dateStr = new Date(hist.timestamp * 1000).toISOString().split("T")[0];
+        heatmapVector[dateStr] = (heatmapVector[dateStr] || 0) + 1;
+      }
+    });
+  });
+
+  const dates = Object.keys(heatmapVector).sort((a, b) => new Date(b).getTime() - new Date(a).getTime());
+  let currentStreak = 0;
+  if (dates.length > 0) {
+    const todayStr = new Date().toISOString().split("T")[0];
+    const yesterdayStr = new Date(Date.now() - 86400000).toISOString().split("T")[0];
+    
+    if (dates[0] === todayStr || dates[0] === yesterdayStr) {
+      currentStreak = 1;
+      for (let i = 0; i < dates.length - 1; i++) {
+        const d1 = new Date(dates[i]);
+        const d2 = new Date(dates[i + 1]);
+        const diffDays = (d1.getTime() - d2.getTime()) / (1000 * 3600 * 24);
+        if (diffDays <= 1.1) {
+          currentStreak++;
+        } else {
+          break;
+        }
+      }
+    }
+  }
+
+  return {
+    activeCount: activeManga.length,
+    activeTitles,
+    totalReadingCounts,
+    currentStreak,
+    heatmapVector,
+    generatedAt: Math.floor(Date.now() / 1000),
+  };
 }
